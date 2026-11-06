@@ -36,6 +36,21 @@ type AccountRuntime struct {
 // otherwise share one <path>.tmp and could rename a half-written file.
 var stateFileMu sync.Mutex
 
+// stateSeq orders snapshots: it is incremented under pluginStateMu when a
+// snapshot is marshalled, and the writer drops a snapshot older than the one
+// already on disk (a slow writer must not overwrite e.g. a newer pause).
+var (
+	stateSeq        uint64
+	lastWrittenSeq  uint64
+	lastWrittenPath string
+)
+
+// nextStateSeq must be called with pluginStateMu held (or s private).
+func nextStateSeq() uint64 {
+	stateSeq++
+	return stateSeq
+}
+
 // saveState writes state atomically: marshal → write to <path>.tmp → rename.
 // The tmp+rename pattern ensures a crash mid-write leaves the prior file
 // intact rather than a truncated one. The caller must hold the lock that
@@ -46,13 +61,17 @@ func saveState(path string, s *PluginState) error {
 	if err != nil {
 		return err
 	}
-	return writeStateFile(path, raw)
+	return writeStateFileSeq(path, raw, nextStateSeq())
 }
 
-// writeStateFile is the file half of saveState; it needs no state lock.
-func writeStateFile(path string, raw []byte) error {
+// writeStateFileSeq is the file half of saveState; it needs no state lock.
+// Snapshots older than the last one written to the same path are dropped.
+func writeStateFileSeq(path string, raw []byte, seq uint64) error {
 	stateFileMu.Lock()
 	defer stateFileMu.Unlock()
+	if path == lastWrittenPath && seq <= lastWrittenSeq {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -60,7 +79,11 @@ func writeStateFile(path string, raw []byte) error {
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	lastWrittenPath, lastWrittenSeq = path, seq
+	return nil
 }
 
 // stateReadRetries/readRetryDelay tolerate transient read locks (Windows AV

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,7 @@ type Worker struct {
 	stopCh  chan struct{}
 	wakeCh  chan struct{} // wakes the sleeping loop when a manual trigger changes nextWake
 	stopped bool
+	paused  atomic.Bool   // live automatic-redeem switch, read by FSMs lock-free
 	running bool          // Run started (doneCh will be closed when it returns)
 	doneCh  chan struct{} // closed when Run returns
 
@@ -85,12 +87,14 @@ func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() ti
 		// worker rather than looping on a bogus "*" credential load.
 		static = nil
 	}
-	return &Worker{
+	w := &Worker{
 		cfg: cfg, enabled: enabled, resolvedEnabled: static, loader: loader, nowFn: nowFn,
 		fsms: map[string]*AccountFSM{}, missingRetryAt: map[string]time.Time{},
 		logs:   newLogRing(maxLogEntries),
 		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1), doneCh: make(chan struct{}),
 	}
+	w.paused.Store(cfg.Paused)
+	return w
 }
 
 // wake nudges the Run loop out of its current sleep so a manual trigger
@@ -183,18 +187,12 @@ func (w *Worker) StopAndWait(timeout time.Duration) {
 // manual resets are unaffected. Resuming pulls IDLE accounts to an immediate
 // patrol so a credit already inside its trigger window is redeemed right away.
 func (w *Worker) SetPaused(paused bool) {
+	// Atomic switch: takes effect at the FSMs' next pause check without
+	// waiting for an in-flight HTTP step to release the FSM lock.
+	w.paused.Store(paused)
 	w.mu.Lock()
 	w.cfg.Paused = paused
-	fsms := make([]*AccountFSM, 0, len(w.fsms))
-	for _, f := range w.fsms {
-		fsms = append(fsms, f)
-	}
 	w.mu.Unlock()
-	for _, f := range fsms {
-		f.mu.Lock()
-		f.Cfg.Paused = paused
-		f.mu.Unlock()
-	}
 	if !paused {
 		_ = w.TriggerCheck("")
 	}
@@ -245,8 +243,11 @@ func (w *Worker) ForceConfirm(authID string) error {
 		w.mu.Unlock()
 		return fmt.Errorf("account %q not found (is it enabled?)", authID)
 	}
-	fsm.ForceConfirm()
+	err := fsm.ForceConfirm()
 	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	w.wake()
 	return nil
 }
@@ -342,7 +343,7 @@ func (w *Worker) stepAccountSafe(authID string) {
 			// Push the account's next wake forward so it retries later.
 			w.mu.Lock()
 			if fsm, ok := w.fsms[authID]; ok {
-				fsm.SetNextWake(w.nowFn().Add(w.cfg.RefreshInterval))
+				fsm.SetNextWake(w.nowFn().Add(fsm.retryInterval()))
 			}
 			w.mu.Unlock()
 		}
@@ -415,11 +416,10 @@ func (w *Worker) ensureFSM(id string) {
 	fsm.Halted = w.isStopped
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
+	fsm.PausedFn = w.paused.Load
 	fsm.SetNextWake(w.nowFn())
 	w.mu.Lock()
 	if _, ok := w.fsms[id]; !ok {
-		// Not shared yet: pick up a SetPaused that ran since cfg was copied.
-		fsm.Cfg.Paused = w.cfg.Paused
 		w.fsms[id] = fsm
 		delete(w.missingRetryAt, id)
 	}

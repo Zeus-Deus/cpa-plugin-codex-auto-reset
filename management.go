@@ -31,6 +31,7 @@ type AccountOption struct {
 // renderStatusHTML, called from the resource/status route.
 type managementHandlers struct {
 	mu                *sync.Mutex // = &pluginStateMu: h.state IS globalState
+	applyMu           sync.Mutex  // serialises config changes (persist + apply)
 	state             *PluginState
 	statePath         string
 	worker            *Worker
@@ -70,6 +71,10 @@ func isResourcePath(path string) bool {
 // status or /v0/resource/plugins/codex-auto-reset/status); it is used to
 // distinguish HTML (resource) from JSON (management) responses for /status.
 func (h *managementHandlers) handle(method, rawPath string, headers http.Header, body []byte) (int, []byte, string) {
+	if retired.Load() && !isResourcePath(rawPath) {
+		st, b := jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "this plugin image was replaced; retry"})
+		return st, b, "application/json"
+	}
 	path := normalizePath(rawPath)
 	// Resource routes are unauthenticated (CPA serves them for browser
 	// navigation) and must stay read-only. The host currently forwards only
@@ -209,10 +214,9 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid settings: " + err.Error()})
 	}
-	h.mu.Lock()
-	cfg := h.state.Config
-	cfg.EnabledAccounts = append([]string(nil), cfg.EnabledAccounts...)
-	h.mu.Unlock()
+	// Parse everything first; merge into the CURRENT config only under the
+	// lock (a pause saved meanwhile must not be overwritten by a stale copy).
+	var refresh, lead, retry time.Duration
 	parse := func(name string, raw *string, dst *time.Duration) error {
 		if raw == nil || strings.TrimSpace(*raw) == "" {
 			return nil
@@ -238,19 +242,32 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		raw  *string
 		dst  *time.Duration
 	}{
-		{"refresh_interval", req.RefreshInterval, &cfg.RefreshInterval},
-		{"trigger_lead_time", req.TriggerLeadTime, &cfg.TriggerLeadTime},
-		{"retry_interval", req.RetryInterval, &cfg.RetryInterval},
+		{"refresh_interval", req.RefreshInterval, &refresh},
+		{"trigger_lead_time", req.TriggerLeadTime, &lead},
+		{"retry_interval", req.RetryInterval, &retry},
 	} {
 		if err := parse(f.name, f.raw, f.dst); err != nil {
 			return jsonStatus(http.StatusBadRequest, map[string]any{"error": err.Error()})
 		}
 	}
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+	h.mu.Lock()
+	cfg := h.state.Config
+	cfg.EnabledAccounts = append([]string(nil), cfg.EnabledAccounts...)
+	if refresh > 0 {
+		cfg.RefreshInterval = refresh
+	}
+	if lead > 0 {
+		cfg.TriggerLeadTime = lead
+	}
+	if retry > 0 {
+		cfg.RetryInterval = retry
+	}
 	if req.EnabledAccounts != nil {
 		cfg.EnabledAccounts = append([]string{}, (*req.EnabledAccounts)...)
 	}
 	cfg = normalizeConfig(cfg)
-	h.mu.Lock()
 	h.state.Config = cfg
 	err := saveState(h.statePath, h.state)
 	h.mu.Unlock()
@@ -281,6 +298,13 @@ func (h *managementHandlers) putPaused(body []byte) (int, []byte) {
 	if err := json.Unmarshal(body, &req); err != nil || req.Paused == nil {
 		return jsonStatus(http.StatusBadRequest, map[string]any{"error": `body must be {"paused": true|false}`})
 	}
+	if !*req.Paused && forcedPaused.Load() {
+		return jsonStatus(http.StatusConflict, map[string]any{"error": "paused by config_yaml (paused: true); remove it from CPA's plugin config to resume"})
+	}
+	// applyMu keeps "persist" and "apply to the worker" in the same order
+	// across concurrent pause/settings/import requests.
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
 	h.mu.Lock()
 	h.state.Config.Paused = *req.Paused
 	err := saveState(h.statePath, h.state)
@@ -330,7 +354,11 @@ func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
 	}
 	if w := h.currentWorker(); w != nil {
 		if err := w.ForceConfirm(req.AuthIndex); err != nil {
-			return jsonStatus(http.StatusNotFound, map[string]any{"error": err.Error()})
+			status := http.StatusNotFound
+			if err == errCycleBusy {
+				status = http.StatusConflict
+			}
+			return jsonStatus(status, map[string]any{"error": err.Error()})
 		}
 	}
 	return jsonOK(map[string]any{"forced": req.AuthIndex})
@@ -352,7 +380,14 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 	if s.Accounts == nil {
 		s.Accounts = map[string]AccountRuntime{}
 	}
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
 	h.mu.Lock()
+	if forcedPaused.Load() {
+		s.Config.Paused = true
+	}
+	s.Config.StateDir = h.state.Config.StateDir
+	s.Config.UserAgent = h.state.Config.UserAgent
 	h.state.Config = s.Config
 	h.state.Accounts = s.Accounts
 	err := saveState(h.statePath, h.state)

@@ -1,28 +1,40 @@
 > **Fork (Zeus-Deus).** This fork is built from source and loaded into a private CLIProxyAPI
 > v8.0.51; it is not published to the plugin store. Differences from upstream v0.1.14:
 >
-> - **Defaults:** redeem **1h** before expiry (`trigger_lead_time`, max 24h), patrol every 6h, and retry
->   the same pinned credit every **10m** (`retry_interval`, 1m to 1h) until it expires.
-> - **Retries stay on the pinned credit.** Transient errors (network, 5xx, 401/403/408/409/425/429,
->   redirects) reuse the same `redeem_request_id`. Before each retry the credit is listed again; if it is
->   gone, the earlier attempt is verified instead of sending another request. `nothing_to_reset` (no
->   covered limit low enough, so the credit is kept) is retried with a new `redeem_request_id` after
->   confirming the same credit is still available. Errors while confirming also retry inside the window
->   instead of dropping the cycle. Automatic requests are only ever sent inside `[expiry - lead, expiry)`.
->   Manual resets still stop on `nothing_to_reset` and retry transient errors at most 5 times.
+> - **Defaults:** redeem **1h** before expiry (`trigger_lead_time`, max 2h), patrol every 6h (max 24h),
+>   and retry every **10m** (`retry_interval`, 1m to 1h) until the credit expires.
+> - **Always the credit about to expire.** At every confirmation the target is the soonest-expiring
+>   available credit (re-pinned if that changed), and an automatic request is only ever sent inside
+>   `[its expiry - lead, its expiry)`. Credits that never expire are never redeemed automatically. After any
+>   cycle the next patrol is one retry interval later, so a second credit that expires soon after is not missed.
+> - **Retries.** Transient errors (network, 5xx, 401/403/408/409/425/429, redirects) keep the same credit and
+>   `redeem_request_id`. Before each retry the credit is listed again: if it is gone, the earlier attempt is
+>   verified instead of resent; if its expiry moved later, the cycle re-arms. `nothing_to_reset` (no covered
+>   limit is low enough, so the credit is kept) is retried with a new `redeem_request_id`. Errors while
+>   patrolling, confirming or loading credentials also retry after `retry_interval`. Manual resets stop on
+>   `nothing_to_reset` and retry transient errors at most 5 times.
 > - **Pause switch:** `PUT /v0/management/plugins/codex-auto-reset/paused` with `{"paused": true|false}`,
->   plus an "Automatic redeem" toggle in the UI. It is saved to disk and survives restarts. While paused,
->   patrols keep running read-only, armed or retrying cycles are cancelled before any request, and a manual
->   Reset still works. Resuming patrols right away.
-> - **Stability:** one state lock shared by the worker and the management handlers (upstream could hit
->   Go's fatal concurrent-map error and crash the proxy). `recover` at the cgo entry point. A replaced worker
->   is stopped and joined, and never sends a consume after stopping. State writes are serialised, with a
->   trailing write after debounce. The run loop sleeps at most 1 minute at a time (it used to sleep hours,
->   and spun every 100ms when idle).
-> - **Safer parsing and verification:** an unknown weekly quota is `-1`, never counted as recovered. An
->   unparseable `expires_at` is never targeted (it is not treated as "never expires").
+>   plus an "Automatic redeem" toggle in the UI. It is saved to disk and survives restarts, and it is
+>   checked lock-free right before every automatic request. While paused, patrols keep running read-only and
+>   no automatic request is sent. Manual Reset still works: it takes over a pending automatic retry (same
+>   credit and request id), and answers 409 while a reset is being verified. `paused: true` in `config_yaml`
+>   is a hard operator switch the API cannot override.
+> - **Stability:**
+>   - One state lock shared by the worker and the management handlers. Upstream could hit Go's fatal
+>     concurrent-map error and crash the proxy.
+>   - `recover` at the cgo entry point.
+>   - `plugin.quiesce` is implemented: a replaced image stops its worker and stops writing state.
+>   - A replaced worker is stopped and joined, and never sends a request after stopping.
+>   - Config changes are applied in order, and state snapshots are written in order (an older snapshot
+>     never overwrites a newer one), with a trailing write after debounce.
+>   - The run loop sleeps at most 1 minute at a time.
+> - **Safer parsing and verification:**
+>   - A reset-credits body without `credits`/`available_count` (or a credit without id/status) is an error.
+>   - An unparseable `expires_at` is never targeted.
+>   - Unknown weekly quota is `-1`, and a reset counts as verified only with known before/after values.
 > - `PUT /settings` updates only the fields you send. Import applies its config to the running worker.
->   The debug routes are removed, redirects are refused, and the SDK is pinned to the host's v8.0.51.
+>   Debug routes are removed, redirects are refused, and the SDK is pinned to the host's v8.0.51. If the
+>   state file falls inside CPA's auth dir, an error is logged: set `state_dir`.
 > - `user_agent` is an operator-only `config_yaml` override (default unchanged).
 > - Note: the UI's opt-in "Remember management key" stores the key in this browser's localStorage.
 >
@@ -58,16 +70,19 @@ CONFIRMING → re-list credits; validate the pinned target is still available,
              unexpired, and due; if early, re-arm the same ID at its fresh T;
              otherwise fetch usage, mint a redeem_request_id, enter RESETTING
 RESETTING  → POST /consume with {redeem_request_id, credit_id}; on success
-             enter VERIFYING; on transient error retry (same idempotency key,
-             1/2/5/10/30 min backoff, max 5); on 4xx or no_credit stop
+             enter VERIFYING; on transient error retry every retry_interval
+             (same idempotency key) until expiry; nothing_to_reset: re-confirm
+             and retry with a new key; no_credit / permanent 4xx: stop
+             (fork; upstream: 1/2/5/10/30 min backoff, max 5)
 VERIFYING  → after 1 min, re-list + fetch usage; triple deduction check
              (target gone + count −1 + weekly recovered); enter DONE
 DONE       → cycle complete; back to IDLE
 ```
 
-An automatic cycle never substitutes another credit if its pinned target
-is redeemed, removed, or expired, even if another credit is already due. A
-missing target ID also abandons the cycle. Credits with no expiry are never
+Fork: at confirmation the target is always the soonest-expiring available
+credit; if that is another credit than the armed one, the pin moves to it and
+its own trigger time applies (a fresh request id is minted, so no ambiguous
+attempt is involved). Upstream never substituted another credit. Credits with no expiry are never
 automatically redeemed; if the pinned target becomes non-expiring, that cycle
 is abandoned. The next IDLE patrol can schedule a new cycle normally.
 
@@ -101,7 +116,8 @@ plugin-owned CPA Management API routes. The browser resource page is only the
 UI surface. State-changing actions require the CPA Management key and are sent
 to `/v0/management/plugins/codex-auto-reset/...`. The page keeps that key only
 in the current browser page session and does not write it to plugin state,
-exports, logs, `localStorage`, or `sessionStorage`. The plugin does not run an
+exports or logs; only the opt-in "Remember management key" box stores it in
+this browser's `localStorage`. The plugin does not run an
 external service and does not send data to the plugin author.
 
 The plugin sends authenticated requests to the ChatGPT backend to read quota
@@ -190,8 +206,10 @@ plugins:
 The plugin reads its 3 user-tunable fields from `config_yaml`:
 
 ```yaml
-refresh_interval: 12h        # IDLE patrol cadence (default 12h)
-trigger_lead_time: 6h        # redeem this long before a credit expires (default 6h)
+refresh_interval: 6h         # IDLE patrol cadence (fork default 6h, max 24h)
+trigger_lead_time: 1h        # redeem this long before a credit expires (fork default 1h, max 2h)
+retry_interval: 10m          # fork: retry cadence until expiry (1m-1h)
+paused: false                # fork: true = hard off switch for automatic redeem
 enabled_accounts:            # default: ["*"] — every Codex account CPA knows,
   - auth_index_1             # including accounts added after startup. Replace
   - auth_index_2             # with explicit auth_indexes to opt a subset in;

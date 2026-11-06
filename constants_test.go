@@ -24,8 +24,8 @@ func TestConstants_MatchSpec(t *testing.T) {
 	if manualMaxRetries != 5 {
 		t.Fatalf("manualMaxRetries = %d", manualMaxRetries)
 	}
-	if patrolErrorRetryInterval != 30*time.Minute {
-		t.Fatalf("patrolErrorRetryInterval = %v", patrolErrorRetryInterval)
+	if credentialRetryInterval != 10*time.Minute {
+		t.Fatalf("credentialRetryInterval = %v", credentialRetryInterval)
 	}
 	if maxLogEntries != 1000 {
 		t.Fatalf("maxLogEntries = %d", maxLogEntries)

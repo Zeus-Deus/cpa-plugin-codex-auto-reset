@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -225,6 +227,7 @@ func TestFork_PausedNeverConsumesAutomatically(t *testing.T) {
 // Pausing while ARMED cancels the cycle at the next step with no consume.
 func TestFork_PauseWhileArmedCancels(t *testing.T) {
 	w, fsm, fc, clock, trigger := armedWorkerFixture(t)
+	fsm.PausedFn = w.paused.Load
 	w.SetPaused(true)
 	clock.t = trigger
 	for i := 0; i < 4; i++ {
@@ -405,12 +408,12 @@ func TestFork_InvalidExpiryNeverTargeted(t *testing.T) {
 
 func TestFork_LeadAndRetryClamped(t *testing.T) {
 	cfg := normalizeConfig(Config{RefreshInterval: time.Hour, TriggerLeadTime: 720 * time.Hour, RetryInterval: 5 * time.Hour})
-	if cfg.TriggerLeadTime != 24*time.Hour || cfg.RetryInterval != time.Hour {
+	if cfg.TriggerLeadTime != 2*time.Hour || cfg.RetryInterval != time.Hour {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, filepath.Join(t.TempDir(), "s.json"), nil)
-	if code, _, _ := h.handle("PUT", "/v0/management/plugins/codex-auto-reset/settings", nil, []byte(`{"trigger_lead_time":"48h"}`)); code != 400 {
-		t.Fatalf("48h lead accepted: %d", code)
+	if code, _, _ := h.handle("PUT", "/v0/management/plugins/codex-auto-reset/settings", nil, []byte(`{"trigger_lead_time":"3h"}`)); code != 400 {
+		t.Fatalf("3h lead accepted: %d", code)
 	}
 }
 
@@ -428,4 +431,154 @@ func TestFork_RedirectsRefused(t *testing.T) {
 	if err == nil || hits != 0 {
 		t.Fatalf("err=%v hits=%d", err, hits)
 	}
+}
+
+// Every handler route is registered with the host (CPA only forwards
+// registered routes) and every registered route has a handler.
+func TestFork_RegisteredRoutesMatchHandlers(t *testing.T) {
+	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, filepath.Join(t.TempDir(), "s.json"), nil)
+	reg := managementRegistrationResponse()
+	seen := map[string]bool{}
+	for _, r := range reg.Routes {
+		seen[r.Method+" "+r.Path] = true
+		code, body, _ := h.handle(r.Method, "/v0/management"+r.Path, nil, []byte(`{}`))
+		if code == 404 && string(body) == `{"error":"route not found"}` {
+			t.Fatalf("registered route has no handler: %s %s", r.Method, r.Path)
+		}
+	}
+	for _, want := range []string{"PUT /plugins/codex-auto-reset/paused", "PUT /plugins/codex-auto-reset/settings", "POST /plugins/codex-auto-reset/reset"} {
+		if !seen[want] {
+			t.Fatalf("route not registered: %s", want)
+		}
+	}
+	for k := range seen {
+		if strings.Contains(k, "/debug/") {
+			t.Fatalf("debug route still registered: %s", k)
+		}
+	}
+}
+
+// A credit that expires sooner than the armed one is picked up at
+// confirmation (re-pin), never left to expire.
+func TestFork_RepinsToSoonerCredit(t *testing.T) {
+	E := time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)
+	clock := &fakeClock{t: E.Add(-3 * time.Hour)}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"a": {ID: "a", Status: "available", ExpiresAt: E}},
+		weeklyPct:   30,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 1},
+		clock:       clock,
+	}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, forkCfg(), fc, clock.Now, nil)
+	fsm.Step() // IDLE -> ARMED on "a" (T = E-1h)
+	if fsm.State() != StateARMED {
+		t.Fatalf("state = %s", fsm.State())
+	}
+	// A sooner credit "b" appears (expires at E-30m).
+	fc.credits["b"] = &Credit{ID: "b", Status: "available", ExpiresAt: E.Add(-30 * time.Minute)}
+	drive(t, fsm, clock)
+	if len(fc.consumeIDs) != 1 || fc.consumeIDs[0] != "b" {
+		t.Fatalf("consumed %v, want [b]", fc.consumeIDs)
+	}
+	if at := fc.consumeTimes[0]; at.Before(E.Add(-90*time.Minute)) || !at.Before(E.Add(-30*time.Minute)) {
+		t.Fatalf("b consumed at %v outside its own window", at)
+	}
+	if fc.credits["a"].Status != "available" {
+		t.Fatal("a must be untouched in this cycle")
+	}
+}
+
+// After a cycle ends, the next patrol is retry_interval later, so a second
+// credit expiring soon after the first still gets its own cycle.
+func TestFork_SecondCreditSoonAfterGetsItsCycle(t *testing.T) {
+	E := time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"a": {ID: "a", Status: "available", ExpiresAt: E},
+			"b": {ID: "b", Status: "available", ExpiresAt: E.Add(2 * time.Hour)},
+		},
+		weeklyPct:   10,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 1},
+		clock:       clock,
+	}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, forkCfg(), fc, clock.Now, nil)
+	for i := 0; i < 100 && fc.consumeCalls < 2; i++ {
+		if next := fsm.StepAndSettle(); next.After(clock.t) {
+			clock.t = next
+		}
+		if fsm.State() == StateVERIFYING {
+			fc.weeklyPct = 10 // used up again before b's window
+		}
+	}
+	if len(fc.consumeIDs) != 2 || fc.consumeIDs[0] != "a" || fc.consumeIDs[1] != "b" {
+		t.Fatalf("consumed %v, want [a b]", fc.consumeIDs)
+	}
+	if at := fc.consumeTimes[1]; at.Before(E.Add(time.Hour)) || !at.Before(E.Add(2*time.Hour)) {
+		t.Fatalf("b consumed at %v outside its window", at)
+	}
+}
+
+// Manual Reset during a pending automatic retry takes it over (same credit,
+// same request id); during verification it answers 409.
+func TestFork_ManualTakesOverPendingRetry(t *testing.T) {
+	w, fsm, fc, clock, trigger := armedWorkerFixture(t)
+	fc.failFirstN = 1
+	fc.failErr = &HTTPStatusError{Code: 503}
+	clock.t = trigger
+	w.stepAccountSafe("acct") // ARMED -> CONFIRMING
+	w.stepAccountSafe("acct") // -> RESETTING
+	w.stepAccountSafe("acct") // POST fails -> retry in 10m
+	if fsm.State() != StateRESETTING || fc.consumeCalls != 1 {
+		t.Fatalf("state=%s calls=%d", fsm.State(), fc.consumeCalls)
+	}
+	if err := w.ForceConfirm("acct"); err != nil {
+		t.Fatal(err)
+	}
+	if !fsm.NextWake().Equal(clock.t) {
+		t.Fatalf("manual takeover not immediate: %v", fsm.NextWake())
+	}
+	w.stepAccountSafe("acct")
+	if fc.consumeCalls != 2 || fc.redeemIDs[0] != fc.redeemIDs[1] || fc.consumeIDs[1] != fc.consumeIDs[0] {
+		t.Fatalf("takeover must reuse target and key: ids=%v keys=%v", fc.consumeIDs, fc.redeemIDs)
+	}
+	if fsm.State() != StateVERIFYING {
+		t.Fatalf("state=%s", fsm.State())
+	}
+	if err := w.ForceConfirm("acct"); err != errCycleBusy {
+		t.Fatalf("ForceConfirm during verify = %v", err)
+	}
+}
+
+func TestFork_ForcedPauseFromYAMLCannotBeResumed(t *testing.T) {
+	forcedPaused.Store(true)
+	defer forcedPaused.Store(false)
+	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, filepath.Join(t.TempDir(), "s.json"), nil)
+	if code, _, _ := h.handle("PUT", "/v0/management/plugins/codex-auto-reset/paused", nil, []byte(`{"paused":false}`)); code != 409 {
+		t.Fatalf("resume under forced pause = %d", code)
+	}
+}
+
+func TestFork_MalformedCreditsRejected(t *testing.T) {
+	for _, body := range []string{`{}`, `{"credits":[]}`, `{"available_count":1}`, `{"credits":[{"status":"available"}],"available_count":1}`} {
+		if _, err := parseResetCreditsResponse([]byte(body), time.Now()); err == nil {
+			t.Fatalf("accepted %s", body)
+		}
+	}
+}
+
+// An older snapshot never overwrites a newer one on disk.
+func TestFork_StateWritesAreOrdered(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := writeStateFileSeq(path, []byte(`{"v":2}`), 1<<62); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStateFileSeq(path, []byte(`{"v":1}`), 1<<61); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	if string(raw) != `{"v":2}` {
+		t.Fatalf("stale snapshot won: %s", raw)
+	}
+	lastWrittenPath, lastWrittenSeq = "", 0
 }

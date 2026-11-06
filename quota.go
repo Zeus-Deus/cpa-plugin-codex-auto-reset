@@ -34,9 +34,9 @@ type rawCredit struct {
 }
 
 type resetCreditsBody struct {
-	Credits        []rawCredit `json:"credits"`
-	AvailableCount int         `json:"available_count"`
-	TotalEarned    int         `json:"total_earned_count"` // accepted, ignored
+	Credits        *[]rawCredit `json:"credits"`            // required
+	AvailableCount *int         `json:"available_count"`    // required
+	TotalEarned    int          `json:"total_earned_count"` // accepted, ignored
 }
 
 // parseResetCreditsResponse parses GET /rate-limit-reset-credits. It applies
@@ -48,8 +48,17 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return Snapshot{}, fmt.Errorf("parse reset-credits response: %w", err)
 	}
-	credits := make([]Credit, 0, len(body.Credits))
-	for _, rc := range body.Credits {
+	// Both fields are required (OpenAI's own client treats them as such): a
+	// body missing them must not look like "no credits, count 0", which
+	// verification would read as a successful deduction.
+	if body.Credits == nil || body.AvailableCount == nil {
+		return Snapshot{}, fmt.Errorf("parse reset-credits response: missing credits/available_count")
+	}
+	credits := make([]Credit, 0, len(*body.Credits))
+	for _, rc := range *body.Credits {
+		if rc.ID == "" || rc.Status == "" {
+			return Snapshot{}, fmt.Errorf("parse reset-credits response: credit without id/status")
+		}
 		c := Credit{ID: rc.ID, Status: rc.Status}
 		if rc.ExpiresAt != nil && *rc.ExpiresAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, *rc.ExpiresAt); err == nil {
@@ -65,7 +74,7 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 	}
 	credits = availableCreditsSorted(credits, now)
 	return Snapshot{
-		AvailableCount: body.AvailableCount,
+		AvailableCount: *body.AvailableCount,
 		Credits:        credits,
 		WeeklyPct:      -1, // not provided by this endpoint
 		CapturedAt:     now,

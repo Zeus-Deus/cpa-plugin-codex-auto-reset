@@ -40,7 +40,15 @@ func (c *cardSimClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRe
 	return c.consume, nil
 }
 
-func countAvailSim(cs []Credit) int { n := 0; for _, c := range cs { if c.Status == "available" { n++ } }; return n }
+func countAvailSim(cs []Credit) int {
+	n := 0
+	for _, c := range cs {
+		if c.Status == "available" {
+			n++
+		}
+	}
+	return n
+}
 
 type simClock struct{ t time.Time }
 

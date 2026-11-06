@@ -306,7 +306,7 @@ func TestAccountsRoute_WildcardMarksAllEnabled(t *testing.T) {
 func TestPutSettings_AcceptsWildcardAndPersists(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
 	body := srv.put(t, "/v0/management/plugins/codex-auto-reset/settings",
-		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"6h","enabled_accounts":["*","idx-a"]}`))
+		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"1h","enabled_accounts":["*","idx-a"]}`))
 	var resp struct {
 		EnabledAccounts []string `json:"enabled_accounts"`
 	}
@@ -331,7 +331,7 @@ func TestPutSettings_AcceptsWildcardAndPersists(t *testing.T) {
 func TestPutSettings_EmptyListStillOptsOut(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
 	body := srv.put(t, "/v0/management/plugins/codex-auto-reset/settings",
-		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"6h","enabled_accounts":[]}`))
+		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"1h","enabled_accounts":[]}`))
 	var resp struct {
 		EnabledAccounts []string `json:"enabled_accounts"`
 	}

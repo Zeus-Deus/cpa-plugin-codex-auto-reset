@@ -141,8 +141,10 @@ const (
 	defaultTriggerLeadTime = 1 * time.Hour
 	defaultRetryInterval   = 10 * time.Minute
 
-	maxTriggerLeadTime = 24 * time.Hour
+	// An automatic redeem must stay "about to expire": at most 2h early.
+	maxTriggerLeadTime = 2 * time.Hour
 	maxRetryInterval   = time.Hour
+	maxRefreshInterval = 24 * time.Hour
 )
 
 // DefaultConfig returns the defaults: 6h patrol, 1h lead time, 10m retry, all
@@ -205,6 +207,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.RetryInterval > maxRetryInterval {
 		cfg.RetryInterval = maxRetryInterval
+	}
+	if cfg.RefreshInterval > maxRefreshInterval {
+		cfg.RefreshInterval = maxRefreshInterval
 	}
 	cfg.UserAgent = strings.TrimSpace(cfg.UserAgent)
 	out := make([]string, 0, len(cfg.EnabledAccounts))

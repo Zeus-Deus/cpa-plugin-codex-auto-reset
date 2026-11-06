@@ -37,6 +37,10 @@ type AccountFSM struct {
 	// Halted, when set (by the worker), reports that the owning worker was
 	// stopped; no consume is sent after that (its replacement takes over).
 	Halted func() bool
+	// PausedFn, when set (by the worker), is the live pause switch. It is
+	// read without the FSM lock's help, so pausing never waits for an
+	// in-flight HTTP step. Nil falls back to Cfg.Paused (tests).
+	PausedFn func() bool
 
 	mu                sync.Mutex
 	state             State
@@ -105,17 +109,39 @@ func (f *AccountFSM) SetNextWake(t time.Time) {
 
 // ForceConfirm requests a manual reset without interrupting consume or verify.
 // Thread-safe; manual intent and its immediate wake are set together.
-func (f *AccountFSM) ForceConfirm() {
+func (f *AccountFSM) ForceConfirm() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.state == StateRESETTING || f.state == StateVERIFYING {
-		return
+	switch f.state {
+	case StateVERIFYING:
+		return errCycleBusy
+	case StateRESETTING:
+		// An automatic attempt is pending (e.g. waiting for its retry, or
+		// cancelled by a pause at its next step): take it over as a manual
+		// reset of the SAME credit with the SAME request id, right now.
+		if !f.manualReset {
+			f.manualReset = true
+			f.nextWake = f.now()
+		}
+		return nil
 	}
 	f.scheduledCreditID = ""
 	f.scheduledExpiresAt = time.Time{}
 	f.manualReset = true
 	f.state = StateCONFIRMING
 	f.nextWake = f.now()
+	return nil
+}
+
+// errCycleBusy: a reset was just sent and is being verified.
+var errCycleBusy = fmt.Errorf("a reset is being verified for this account; try again in a minute")
+
+// paused reports the live automatic-redeem pause switch.
+func (f *AccountFSM) paused() bool {
+	if f.PausedFn != nil {
+		return f.PausedFn()
+	}
+	return f.Cfg.Paused
 }
 
 // Step executes one FSM tick at f.Now() and returns the next scheduled wake.
@@ -173,7 +199,9 @@ func (f *AccountFSM) StepAndSettle() time.Time {
 	}
 	if wake.IsZero() && f.state == StateDONE {
 		f.resetLocked()
-		wake = f.now().Add(f.Cfg.RefreshInterval)
+		// Patrol again soon (not after a full refresh_interval): another
+		// credit may already be close to expiry.
+		wake = f.now().Add(f.retryInterval())
 	}
 	f.nextWake = wake
 	return wake
@@ -212,11 +240,7 @@ func (f *AccountFSM) retryInterval() time.Duration {
 // patrolRetryAt is when a failed patrol/confirmation looks again: the sooner
 // of the patrol interval and patrolErrorRetryInterval.
 func (f *AccountFSM) patrolRetryAt(now time.Time) time.Time {
-	d := f.Cfg.RefreshInterval
-	if d > patrolErrorRetryInterval {
-		d = patrolErrorRetryInterval
-	}
-	return now.Add(d)
+	return now.Add(f.retryInterval())
 }
 
 func (f *AccountFSM) stepIDLE() time.Time {
@@ -262,9 +286,9 @@ func (f *AccountFSM) stepIDLE() time.Time {
 			map[string]any{"credit_id": target.ID, "expires_at": target.ExpiresAt})
 		return next
 	}
-	if f.Cfg.Paused {
-		// Paused: report what would happen, never arm. Patrol again within the
-		// trigger window so the UI stays current; resuming triggers a patrol.
+	if f.paused() {
+		// Paused: report what would happen, never arm. Resuming triggers an
+		// immediate patrol.
 		next := now.Add(f.Cfg.RefreshInterval)
 		f.nextWake = next
 		f.log("warn",
@@ -322,7 +346,7 @@ func (f *AccountFSM) retryAutoConfirm(now time.Time, why string) time.Time {
 
 func (f *AccountFSM) stepCONFIRMING() time.Time {
 	now := f.now()
-	if !f.manualReset && f.Cfg.Paused {
+	if !f.manualReset && f.paused() {
 		return f.abandonAuto("warn", "automatic redeem is paused; armed cycle cancelled before any reset request")
 	}
 	snap, err := f.Client.ListCredits(f.Creds)
@@ -340,28 +364,34 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		if len(avail) > 0 {
 			target = avail[0]
 		}
-	} else if f.scheduledCreditID != "" {
-		for _, credit := range avail {
-			if credit.ID == f.scheduledCreditID {
-				target = credit
-				break
-			}
+	} else if len(avail) > 0 && !avail[0].ExpiresAt.IsZero() {
+		// Automatic: always the soonest-expiring available credit right now
+		// (never-expiring ones sort last and are never chosen). If it differs
+		// from the armed one (that one was redeemed elsewhere, or a sooner one
+		// appeared), re-pin; the trigger-time check below applies to it. A
+		// fresh request id is minted below, so nothing ambiguous is dropped.
+		target = avail[0]
+		if target.ID != f.scheduledCreditID {
+			f.log("warn", fmt.Sprintf("target changed from %s to %s (now the soonest-expiring credit)", shortID(f.scheduledCreditID), shortID(target.ID)),
+				"re-pin", nil, map[string]any{"from": f.scheduledCreditID, "to": target.ID, "expires_at": target.ExpiresAt})
 		}
 	}
 	if target.ID == "" {
 		f.state = StateDONE
-		f.log("warn", "target credit missing or unavailable before reset", "abandon", nil,
+		f.log("warn", "no available expiring credit before reset", "abandon", nil,
 			map[string]any{"credit_id": f.scheduledCreditID})
 		return time.Time{}
 	}
 	if !f.manualReset {
-		if target.ExpiresAt.IsZero() {
-			f.state = StateDONE
-			f.log("info", "target credit no longer expires", "abandon", nil, nil)
-			return time.Time{}
-		}
+		f.scheduledCreditID = target.ID
 		f.scheduledExpiresAt = target.ExpiresAt
 		T := f.triggerTime(target)
+		if now.Before(f.armThreshold(target)) {
+			f.state = StateDONE
+			f.log("info", fmt.Sprintf("credit %s is not near its trigger time any more", shortID(target.ID)), "patrol", nil,
+				map[string]any{"credit_id": target.ID, "expires_at": target.ExpiresAt})
+			return time.Time{}
+		}
 		if now.Before(T) {
 			f.state = StateARMED
 			f.nextWake = T
@@ -412,10 +442,6 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 func (f *AccountFSM) stepRESETTING() time.Time {
 	now := f.now()
 	auto := !f.manualReset
-	if f.Halted != nil && f.Halted() {
-		f.log("info", "worker stopping; reset request not sent (the restarted worker re-checks)", "none", nil, nil)
-		return time.Time{}
-	}
 	if f.attempt.Attempt > 0 {
 		// A retry: re-list first. If the pinned credit is gone, an earlier
 		// (ambiguous) attempt probably succeeded: verify instead of sending
@@ -447,6 +473,7 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 			f.attempt.TargetExpiresAt = found.ExpiresAt
 			f.scheduledExpiresAt = found.ExpiresAt
 		}
+		now = f.now() // the re-list took time; check the window against fresh time
 	}
 	if auto {
 		// Defense in depth: an automatic consume is only ever sent for the
@@ -454,13 +481,26 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		switch {
 		case f.attempt.TargetCreditID == "" || f.attempt.TargetCreditID != f.scheduledCreditID:
 			return f.abandonAuto("error", "internal: reset target does not match the armed credit; no request sent")
-		case f.Cfg.Paused:
+		case f.paused():
 			return f.abandonAuto("warn", "automatic redeem is paused; no reset request sent")
 		case f.attempt.TargetExpiresAt.IsZero() || !now.Before(f.attempt.TargetExpiresAt):
 			return f.abandonAuto("error", fmt.Sprintf("credit %s expired before the reset request could be sent", shortID(f.attempt.TargetCreditID)))
 		case now.Before(f.attempt.TargetExpiresAt.Add(-f.Cfg.TriggerLeadTime)):
-			return f.abandonAuto("error", fmt.Sprintf("credit %s is not due yet; no reset request sent", shortID(f.attempt.TargetCreditID)))
+			// Its expiry moved later: not due any more. Re-arm (new id later).
+			T := f.attempt.TargetExpiresAt.Add(-f.Cfg.TriggerLeadTime)
+			f.state = StateARMED
+			f.attempt = ResetAttempt{}
+			f.nextWake = T
+			f.log("info", "target credit's expiry moved later; re-armed, no reset request sent", "sleep to trigger time", &T,
+				map[string]any{"credit_id": f.scheduledCreditID, "T": T})
+			return T
 		}
+	}
+	// Last check right before the POST: a replaced (stopped) worker must not
+	// send anything; its successor re-checks from scratch.
+	if f.Halted != nil && f.Halted() {
+		f.log("info", "worker stopping; reset request not sent (the restarted worker re-checks)", "none", nil, nil)
+		return time.Time{}
 	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
 	switch classifyConsume(resp, err) {
@@ -471,7 +511,7 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		f.log("info",
 			fmt.Sprintf("reset request accepted (code=%s, windows_reset=%d); will verify in %v",
 				resp.Code, resp.WindowsReset, postResetVerifyDelay),
-			fmt.Sprintf("verify in %v", postResetVerifyDelay), &f.verifyDue,
+			fmt.Sprintf("verify in %v", postResetVerifyDelay), timePtr(f.verifyDue),
 			map[string]any{
 				"redeem_request_id": f.attempt.RedeemRequestID,
 				"credit_id":         f.attempt.TargetCreditID,
@@ -528,7 +568,7 @@ func (f *AccountFSM) scheduleConsumeRetry(now time.Time, auto bool, err error) t
 	f.nextWake = next
 	f.log("warn",
 		fmt.Sprintf("reset failed (attempt %d): %v; retrying with same idempotency key", f.attempt.Attempt, err),
-		fmt.Sprintf("retry in %v", f.retryInterval()), &f.attempt.NextRetryAt,
+		fmt.Sprintf("retry in %v", f.retryInterval()), timePtr(next),
 		map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "attempt": f.attempt.Attempt})
 	return next
 }
@@ -562,7 +602,10 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	}
 	countDown1 := credits.AvailableCount == f.attempt.PreSnapshot.AvailableCount-1
 	// Unknown (-1) post-reset quota never counts as recovered.
-	quotaUp := usage.WeeklyPct >= 0 && (usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
+	// Both readings must be known: an unknown (-1) baseline would make any
+	// known value look like an increase.
+	quotaUp := usage.WeeklyPct >= 0 && f.attempt.PreSnapshot.WeeklyPct >= 0 &&
+		(usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
 
 	f.state = StateDONE
 	// Build detailed details map with full before/after snapshot.
@@ -645,6 +688,10 @@ func (f *AccountFSM) TakePendingHistory() *ResetRecord {
 	f.pendingHistory = nil
 	return rec
 }
+
+// timePtr returns a pointer to a copy (log entries must not alias FSM fields
+// that later steps mutate).
+func timePtr(t time.Time) *time.Time { return &t }
 
 // shortID truncates a long credit/redeem ID for readable log messages.
 // "RateLimitResetCredit_d7087f83469c819182a87d5916512c9c" -> "d7087f83…"

@@ -331,7 +331,7 @@ func TestWorker_ManagementCheckRespectsPinnedCycle(t *testing.T) {
 			if fsm.State() == StateRESETTING {
 				w.stepAccountSafe("acct")
 			}
-			if fsm.State() != StateIDLE || fc.consumeCalls != 0 || !fsm.NextWake().Equal(trigger.Add(w.cfg.RefreshInterval)) {
+			if fsm.State() != StateIDLE || fc.consumeCalls != 0 || !fsm.NextWake().Equal(trigger.Add(fsm.retryInterval())) {
 				t.Fatalf("abandoned cycle: state=%s consumed=%v wake=%v", fsm.State(), fc.consumeIDs, fsm.NextWake())
 			}
 		})
@@ -467,21 +467,32 @@ func TestWorker_ManualResetPreservesActiveAttempt(t *testing.T) {
 	w.stepAccountSafe("acct")
 	w.stepAccountSafe("acct")
 	w.stepAccountSafe("acct")
-	for _, state := range []State{StateRESETTING, StateVERIFYING} {
-		if fsm.State() != state {
-			t.Fatalf("state=%s, want %s", fsm.State(), state)
-		}
-		wake := fsm.NextWake()
-		rrid := fsm.attempt.RedeemRequestID
-		if err := w.ForceConfirm("acct"); err != nil {
-			t.Fatal(err)
-		}
-		if fsm.State() != state || !fsm.NextWake().Equal(wake) || fsm.attempt.RedeemRequestID != rrid {
-			t.Fatalf("manual reset interrupted %s: state=%s wake=%v attempt=%+v", state, fsm.State(), fsm.NextWake(), fsm.attempt)
-		}
-		clock.t = wake
-		w.stepAccountSafe("acct")
+	// Fork: Reset during a pending automatic retry takes it over at once,
+	// keeping the same credit and request id.
+	if fsm.State() != StateRESETTING {
+		t.Fatalf("state=%s, want RESETTING", fsm.State())
 	}
+	rrid := fsm.attempt.RedeemRequestID
+	if err := w.ForceConfirm("acct"); err != nil {
+		t.Fatal(err)
+	}
+	if fsm.State() != StateRESETTING || !fsm.NextWake().Equal(clock.t) || fsm.attempt.RedeemRequestID != rrid {
+		t.Fatalf("takeover: state=%s wake=%v attempt=%+v", fsm.State(), fsm.NextWake(), fsm.attempt)
+	}
+	w.stepAccountSafe("acct")
+	// During verification a manual Reset is refused (409 at the API).
+	if fsm.State() != StateVERIFYING {
+		t.Fatalf("state=%s, want VERIFYING", fsm.State())
+	}
+	wake := fsm.NextWake()
+	if err := w.ForceConfirm("acct"); err != errCycleBusy {
+		t.Fatalf("ForceConfirm during verify = %v", err)
+	}
+	if !fsm.NextWake().Equal(wake) || fsm.attempt.RedeemRequestID != rrid {
+		t.Fatal("verification disturbed")
+	}
+	clock.t = wake
+	w.stepAccountSafe("acct")
 	if fc.consumeCalls != 2 || fc.redeemIDs[0] != fc.redeemIDs[1] || fc.consumeIDs[0] != "a" || fc.consumeIDs[1] != "a" {
 		t.Fatalf("retry changed: targets=%v redeemIDs=%v", fc.consumeIDs, fc.redeemIDs)
 	}

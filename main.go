@@ -154,8 +154,43 @@ func cliproxyPluginShutdown() {
 }
 
 // shutdownWait bounds how long shutdown/reconfigure waits for an in-flight
-// worker step (at most a couple of 30s HTTP calls) before moving on.
-const shutdownWait = 45 * time.Second
+// worker step (at most two 30s HTTP calls) before moving on. Even past it, a
+// stopped worker never sends a consume (AccountFSM.Halted is checked right
+// before the POST).
+const shutdownWait = 75 * time.Second
+
+var (
+	// retired is set by plugin.quiesce: this image was replaced by a newer
+	// one, so it must not run a worker, persist state or serve mutations.
+	retired atomic.Bool
+	// forcedPaused: config_yaml has paused: true (operator kill switch).
+	forcedPaused atomic.Bool
+)
+
+func quiescePlugin() {
+	retired.Store(true)
+	pluginStateMu.Lock()
+	w := globalWorker
+	pluginStateMu.Unlock()
+	if w != nil {
+		w.StopAndWait(shutdownWait)
+	}
+}
+
+// underAuthDir reports whether path lies inside CPA's auth dir (derived from
+// the auth entries' paths), which CPA scans recursively for *.json auths.
+func underAuthDir(path string, entries []pluginapi.HostAuthFileEntry) bool {
+	for _, e := range entries {
+		if e.Path == "" || !filepath.IsAbs(e.Path) {
+			continue
+		}
+		dir := filepath.Dir(e.Path)
+		if rel, err := filepath.Rel(dir, path); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+			return true
+		}
+	}
+	return false
+}
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
@@ -279,6 +314,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(managementRegistrationResponse())
 	case pluginabi.MethodManagementHandle:
 		return okEnvelope(handleManagementRequest(request))
+	case pluginabi.MethodPluginQuiesce:
+		// CPA is about to load a replacement image of this plugin (upgrade).
+		// The old image is never unloaded, so stop its worker for good and
+		// stop persisting; a rollback re-runs reconfigure, which revives it.
+		quiescePlugin()
+		return okEnvelope(struct{}{})
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -300,14 +341,24 @@ func configurePlugin(raw []byte) error {
 		cfg = parsed
 	}
 
+	// config_yaml `paused: true` is a hard operator kill switch: it wins over
+	// the saved state and cannot be resumed from the UI/API.
+	yamlPaused := cfg.Paused
+
 	// Stop a previous worker (reconfigure) and wait for its in-flight step
-	// before taking the state lock; see restartWorkerFromState.
+	// before taking the state lock; see restartWorkerFromState. Flush its
+	// in-memory state first so the reload below does not drop recent logs.
 	pluginStateMu.Lock()
 	prev := globalWorker
+	prevPath := globalStatePath
 	pluginStateMu.Unlock()
 	if prev != nil {
 		prev.StopAndWait(shutdownWait)
+		if prevPath != "" && !retired.Load() {
+			_ = SaveStateNow(prevPath)
+		}
 	}
+	retired.Store(false)
 
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
@@ -348,6 +399,10 @@ func configurePlugin(raw []byte) error {
 	// on every load (it is never persisted in state.json).
 	cfg.UserAgent = yamlUserAgent
 	setUserAgent(yamlUserAgent)
+	forcedPaused.Store(yamlPaused)
+	if yamlPaused {
+		cfg.Paused = true
+	}
 	globalState = loaded
 	globalState.Config = cfg
 
@@ -356,8 +411,9 @@ func configurePlugin(raw []byte) error {
 		globalWorker.Stop()
 	}
 	enabled := cfg.EnabledAccounts
-	globalWorker = NewWorker(cfg, enabled, hostCredsLoader, time.Now)
-	globalWorker.AccountEnumerator = listCodexAuthIndexes
+	w := NewWorker(cfg, enabled, hostCredsLoader, time.Now)
+	w.AccountEnumerator = listCodexAuthIndexes
+	globalWorker = w
 	// Always announce the state location and load source — on FIRST load too,
 	// not just reconfigure — so operators know what to back up / volume-mount.
 	loadLevel := "info"
@@ -370,6 +426,18 @@ func configurePlugin(raw []byte) error {
 		Timestamp: time.Now(), Level: loadLevel, Scope: "system",
 		Message: "state file: " + statePath + " (loaded: " + source + ")",
 	})
+	if underAuthDir(statePath, authEntries) {
+		globalWorker.Logs().append(LogEntry{
+			Timestamp: time.Now(), Level: "error", Scope: "system",
+			Message: "state file is inside CPA's auth dir, which CPA scans for auth files; set an absolute state_dir in this plugin's config",
+		})
+	}
+	if yamlPaused {
+		globalWorker.Logs().append(LogEntry{
+			Timestamp: time.Now(), Level: "warn", Scope: "system",
+			Message: "automatic redeem is paused by config_yaml (paused: true); remove it there to allow resuming",
+		})
+	}
 	if authListErr != nil {
 		globalWorker.Logs().append(LogEntry{
 			Timestamp: time.Now(), Level: "warn", Scope: "system",
@@ -387,12 +455,12 @@ func configurePlugin(raw []byte) error {
 	// Wire StateSync so the management UI sees live FSM state and a restart
 	// resumes mid-cycle. Debounce persistence: only write to disk at most every
 	// stateSyncPersistInterval to avoid hammering the file on tight retry loops.
-	globalWorker.StateSync = func(authID string, fsm *AccountFSM) {
-		rec := syncFSMIntoGlobalState(globalWorker.Logs(), authID, fsm)
-		afterVerifiedReset(globalWorker.Logs(), authID, rec)
+	w.StateSync = func(authID string, fsm *AccountFSM) {
+		rec := syncFSMIntoGlobalState(w.Logs(), authID, fsm)
+		afterVerifiedReset(w.Logs(), authID, rec)
 		debouncedSaveState(statePath)
 	}
-	go globalWorker.Run()
+	go w.Run()
 
 	if globalHandlers == nil {
 		globalHandlers = newManagementHandlers(globalState, statePath, globalWorker)
@@ -434,13 +502,14 @@ func restartWorkerFromState() {
 	} else if len(globalState.Logs) > 0 {
 		w.Logs().load(globalState.Logs)
 	}
+	statePath := globalStatePath // read under pluginStateMu (held here)
+	if statePath == "" {
+		statePath = defaultStatePath() // defensive: never expected
+	}
 	w.StateSync = func(authID string, fsm *AccountFSM) {
 		rec := syncFSMIntoGlobalState(w.Logs(), authID, fsm)
 		afterVerifiedReset(w.Logs(), authID, rec)
-		if globalStatePath == "" {
-			globalStatePath = defaultStatePath() // defensive: never expected
-		}
-		debouncedSaveState(globalStatePath)
+		debouncedSaveState(statePath)
 	}
 	globalWorker = w
 	if globalHandlers != nil {
@@ -596,10 +665,9 @@ func managementRegistrationResponse() pluginapi.ManagementRegistrationResponse {
 	routes := []pluginapi.ManagementRoute{
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/status"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/accounts"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/auth-list"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/usage"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/logs"},
 		{Method: http.MethodPut, Path: "/plugins/codex-auto-reset/settings"},
+		{Method: http.MethodPut, Path: "/plugins/codex-auto-reset/paused"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check/all"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/reset"},
@@ -885,6 +953,9 @@ func debouncedSaveState(path string) {
 
 // SaveStateNow forces an immediate persist (used on shutdown / reconfigure).
 func SaveStateNow(path string) error {
+	if retired.Load() {
+		return nil // a newer image owns the state file now
+	}
 	lastStatePersistMu.Lock()
 	lastStatePersist = time.Now()
 	lastStatePersistMu.Unlock()
@@ -894,11 +965,12 @@ func SaveStateNow(path string) error {
 	// whole CPA process down. Only the file write happens outside the lock.
 	pluginStateMu.Lock()
 	raw, err := json.MarshalIndent(globalState, "", "  ")
+	seq := nextStateSeq()
 	pluginStateMu.Unlock()
 	if err != nil {
 		return err
 	}
-	return writeStateFile(path, raw)
+	return writeStateFileSeq(path, raw, seq)
 }
 
 var _ = strings.TrimSpace

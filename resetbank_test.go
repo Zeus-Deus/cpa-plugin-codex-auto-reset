@@ -487,11 +487,21 @@ func TestFSM_PinnedTargetUnavailable(t *testing.T) {
 				if fsm.State() == StateRESETTING {
 					fsm.Step()
 				}
-				if fsm.State() != StateDONE || fc.consumeCalls != 0 || fsm.attempt.RedeemRequestID != "" {
-					t.Fatalf("state=%s consumed=%v attempt=%+v; vanished target must abandon this cycle without substitution", fsm.State(), fc.consumeIDs, fsm.attempt)
+				if replacement == "far_future" {
+					// Nothing else is due: the cycle ends without a consume.
+					if fsm.State() != StateDONE || fc.consumeCalls != 0 || fsm.attempt.RedeemRequestID != "" {
+						t.Fatalf("state=%s consumed=%v attempt=%+v; nothing due must abandon without a consume", fsm.State(), fc.consumeIDs, fsm.attempt)
+					}
+					if fc.credits["b"].Status != "available" {
+						t.Fatal("far-future credit was consumed")
+					}
+					return
 				}
-				if fc.credits["b"].Status != "available" {
-					t.Fatal("replacement credit was consumed")
+				// Fork: the pin follows the soonest-expiring credit. b is now
+				// the soonest and inside its own window, so it is redeemed
+				// (fresh request id); a is never touched.
+				if len(fc.consumeIDs) != 1 || fc.consumeIDs[0] != "b" || fsm.State() != StateVERIFYING {
+					t.Fatalf("state=%s consumed=%v; want the due replacement b", fsm.State(), fc.consumeIDs)
 				}
 			})
 		}
@@ -505,26 +515,29 @@ func TestFSM_AutomaticConfirmRequiresTarget(t *testing.T) {
 			fsm.Reset()
 			fsm.state = state
 			clock.t = trigger
-			if state == StateARMED {
+			for i := 0; i < 4 && fc.consumeCalls == 0 && fsm.State() != StateDONE; i++ {
 				fsm.Step()
 			}
-			fsm.Step()
-			if fsm.State() != StateDONE || fc.consumeCalls != 0 || fsm.attempt.RedeemRequestID != "" {
-				t.Fatalf("automatic confirmation without target: state=%s attempt=%+v", fsm.State(), fsm.attempt)
+			// Fork: without a pin, confirmation selects the soonest-expiring
+			// credit and still applies its trigger time (a is due at T).
+			if len(fc.consumeIDs) != 1 || fc.consumeIDs[0] != "a" {
+				t.Fatalf("automatic confirmation without pin: state=%s consumed=%v", fsm.State(), fc.consumeIDs)
 			}
 		})
 	}
 }
 
-func TestFSM_PinnedTargetSurvivesEarlierCredit(t *testing.T) {
+// Fork: a credit that expires sooner than the armed one takes over the pin at
+// confirmation (it is the one about to expire); exactly one consume.
+func TestFSM_RepinsToEarlierCredit(t *testing.T) {
 	fsm, fc, clock, trigger := armedFSMFixture(t)
 	clock.t = trigger
 	fc.credits["new"] = &Credit{ID: "new", Status: "available", ExpiresAt: trigger.Add(time.Hour)}
 	fsm.Step()
 	fsm.Step()
 	fsm.Step()
-	if fc.consumeCalls != 1 || fc.consumeIDs[0] != "a" {
-		t.Fatalf("consumed=%v, want original armed target a", fc.consumeIDs)
+	if fc.consumeCalls != 1 || fc.consumeIDs[0] != "new" {
+		t.Fatalf("consumed=%v, want the sooner credit", fc.consumeIDs)
 	}
 }
 
@@ -541,6 +554,14 @@ func TestFSM_ConfirmRevalidatesTrigger(t *testing.T) {
 			fsm.SetNextWake(clock.t)
 			fsm.Step()
 			wake := fsm.Step()
+			if change == "expiry_extended" {
+				// Fork: no longer within one patrol of its trigger time, so
+				// the cycle ends; a patrol (10m later) re-arms it in time.
+				if fsm.State() != StateDONE || fsm.attempt.RedeemRequestID != "" || fc.consumeCalls != 0 {
+					t.Fatalf("state=%s attempt=%+v consumed=%v", fsm.State(), fsm.attempt, fc.consumeIDs)
+				}
+				return
+			}
 			if fsm.State() != StateARMED || !wake.Equal(want) || !fsm.NextWake().Equal(want) {
 				t.Fatalf("state=%s wake=%v nextWake=%v; want re-arm at %v", fsm.State(), wake, fsm.NextWake(), want)
 			}
@@ -552,8 +573,9 @@ func TestFSM_ConfirmRevalidatesTrigger(t *testing.T) {
 			fsm.Step()
 			fsm.Step()
 			fsm.Step()
-			if fc.consumeCalls != 1 || fc.consumeIDs[0] != "a" || !fsm.attempt.StartedAt.Equal(want) {
-				t.Fatalf("consumed=%v started=%v, want a at %v", fc.consumeIDs, fsm.attempt.StartedAt, want)
+			// Fork: "new" now expires sooner than a, so it takes the pin.
+			if fc.consumeCalls != 1 || fc.consumeIDs[0] != "new" || !fsm.attempt.StartedAt.Equal(want) {
+				t.Fatalf("consumed=%v started=%v, want new at %v", fc.consumeIDs, fsm.attempt.StartedAt, want)
 			}
 		})
 	}
@@ -592,7 +614,7 @@ func TestFSM_StepAndSettleResetsDoneAndSchedulesPatrol(t *testing.T) {
 	fsm.Step() // ARMED -> CONFIRMING (wake=now)
 
 	wake := fsm.StepAndSettle()
-	want := trigger.Add(fsm.Cfg.RefreshInterval)
+	want := trigger.Add(fsm.retryInterval()) // fork: patrol again after retry_interval
 	if fsm.State() != StateIDLE || !wake.Equal(want) || !fsm.NextWake().Equal(want) {
 		t.Fatalf("settle: state=%s wake=%v nextWake=%v, want IDLE patrol at %v", fsm.State(), wake, fsm.NextWake(), want)
 	}

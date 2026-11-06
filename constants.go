@@ -27,7 +27,7 @@ const (
 	// mid-refresh, or operator re-login). Previously a failed initial load
 	// left the account out of the FSM map forever, and a failure while running
 	// waited a full refresh_interval (default 12h).
-	credentialRetryInterval = 30 * time.Minute
+	credentialRetryInterval = 10 * time.Minute
 	// wildcardResolveInterval throttles how often the worker re-queries the
 	// host for the Codex account set while the all-accounts wildcard ("*") is
 	// enabled. Without it the idle loop (100ms ticks when nothing is
@@ -39,8 +39,3 @@ const (
 // target a credit with no expiry, so expiry cannot bound it). Automatic cycles
 // are bounded by the pinned credit's expiry instead.
 const manualMaxRetries = 5
-
-// patrolErrorRetryInterval caps how long a failed patrol or pre-reset
-// confirmation waits before trying again, so one network blip near a credit's
-// trigger time cannot push the next look past its expiry.
-const patrolErrorRetryInterval = 30 * time.Minute
