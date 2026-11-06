@@ -21,14 +21,11 @@ func TestConstants_MatchSpec(t *testing.T) {
 	if postResetVerifyDelay != 1*time.Minute {
 		t.Fatalf("postResetVerifyDelay = %v", postResetVerifyDelay)
 	}
-	want := []time.Duration{1 * time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute}
-	if len(resetRetryDelays) != len(want) {
-		t.Fatalf("resetRetryDelays len = %d", len(resetRetryDelays))
+	if manualMaxRetries != 5 {
+		t.Fatalf("manualMaxRetries = %d", manualMaxRetries)
 	}
-	for i := range want {
-		if resetRetryDelays[i] != want[i] {
-			t.Fatalf("resetRetryDelays[%d] = %v, want %v", i, resetRetryDelays[i], want[i])
-		}
+	if patrolErrorRetryInterval != 30*time.Minute {
+		t.Fatalf("patrolErrorRetryInterval = %v", patrolErrorRetryInterval)
 	}
 	if maxLogEntries != 1000 {
 		t.Fatalf("maxLogEntries = %d", maxLogEntries)

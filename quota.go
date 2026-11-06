@@ -52,8 +52,13 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 	for _, rc := range body.Credits {
 		c := Credit{ID: rc.ID, Status: rc.Status}
 		if rc.ExpiresAt != nil && *rc.ExpiresAt != "" {
-			if t, err := time.Parse(time.RFC3339, *rc.ExpiresAt); err == nil {
+			if t, err := time.Parse(time.RFC3339Nano, *rc.ExpiresAt); err == nil {
 				c.ExpiresAt = t
+			} else {
+				// An unreadable expiry must not turn into "never expires":
+				// mark the credit unusable so it is never targeted, and
+				// keep it visible in the snapshot.
+				c.Status = "invalid_expiry:" + rc.Status
 			}
 		}
 		credits = append(credits, c)
@@ -69,10 +74,12 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 
 // parseUsageResponse parses GET /wham/usage using flexible map lookups.
 // The real wire shape (confirmed from live data) is:
-//   "rate_limit": {
-//     "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
-//     "secondary_window": null
-//   }
+//
+//	"rate_limit": {
+//	  "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
+//	  "secondary_window": null
+//	}
+//
 // primary_window can be the WEEKLY window (604800s) when there's no
 // secondary. We identify the weekly window by limit_window_seconds ≈ 604800,
 // NOT by position (primary/secondary). code_review_rate_limit may also be
@@ -121,7 +128,10 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
-	weeklyPct := 100
+	// -1 = unknown (no weekly window in the response). Never default to
+	// 100%: that would let verification pass without evidence and clear
+	// CPA's routing cooldown for an account that may still be limited.
+	weeklyPct := -1
 	if weeklyUsed >= 0 {
 		weeklyPct = 100 - int(weeklyUsed+0.5)
 		if weeklyPct < 0 {

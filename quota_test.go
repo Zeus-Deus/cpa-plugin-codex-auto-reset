@@ -88,8 +88,8 @@ func TestParseUsageResponse_NoWeeklyWindowDefaultsFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if snap.WeeklyPct != 100 {
-		t.Fatalf("WeeklyPct = %d, want 100 when no weekly window", snap.WeeklyPct)
+	if snap.WeeklyPct != -1 {
+		t.Fatalf("WeeklyPct = %d, want -1 (unknown) when no weekly window", snap.WeeklyPct)
 	}
 }
 
@@ -99,8 +99,8 @@ func TestParseUsageResponse_NoRateLimitDefaultsFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if snap.WeeklyPct != 100 {
-		t.Fatalf("WeeklyPct = %d, want 100 when no rate-limit block", snap.WeeklyPct)
+	if snap.WeeklyPct != -1 {
+		t.Fatalf("WeeklyPct = %d, want -1 (unknown) when no rate-limit block", snap.WeeklyPct)
 	}
 }
 

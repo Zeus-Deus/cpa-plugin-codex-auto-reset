@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -30,15 +31,29 @@ type AccountRuntime struct {
 	LastSnapshot Snapshot     `json:"last_snapshot,omitempty"`
 }
 
+// stateFileMu serialises writers of the state file: concurrent saves (worker
+// sync, management handlers, an old worker finishing its last step) would
+// otherwise share one <path>.tmp and could rename a half-written file.
+var stateFileMu sync.Mutex
+
 // saveState writes state atomically: marshal → write to <path>.tmp → rename.
 // The tmp+rename pattern ensures a crash mid-write leaves the prior file
-// intact rather than a truncated one.
+// intact rather than a truncated one. The caller must hold the lock that
+// guards s (pluginStateMu for globalState) or own s exclusively, because
+// marshalling iterates its maps and slices.
 func saveState(path string, s *PluginState) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	raw, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
+		return err
+	}
+	return writeStateFile(path, raw)
+}
+
+// writeStateFile is the file half of saveState; it needs no state lock.
+func writeStateFile(path string, raw []byte) error {
+	stateFileMu.Lock()
+	defer stateFileMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"

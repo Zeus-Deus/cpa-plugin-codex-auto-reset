@@ -34,6 +34,9 @@ type AccountFSM struct {
 	Client ResetClient
 	Now    func() time.Time
 	Logf   LogFn
+	// Halted, when set (by the worker), reports that the owning worker was
+	// stopped; no consume is sent after that (its replacement takes over).
+	Halted func() bool
 
 	mu                sync.Mutex
 	state             State
@@ -41,7 +44,10 @@ type AccountFSM struct {
 	nextWake          time.Time
 	verifyDue         time.Time
 	scheduledCreditID string
-	manualReset       bool
+	// scheduledExpiresAt is the pinned credit's expiry as seen when it was
+	// armed (refreshed on every confirmation). It bounds automatic retries.
+	scheduledExpiresAt time.Time
+	manualReset        bool
 	// testPostStep, when non-nil, runs inside StepAndSettle after the tick
 	// but BEFORE the settle decision, with mu still held. Tests use it to
 	// prove that a concurrent ForceConfirm/TriggerCheck cannot interleave
@@ -106,6 +112,7 @@ func (f *AccountFSM) ForceConfirm() {
 		return
 	}
 	f.scheduledCreditID = ""
+	f.scheduledExpiresAt = time.Time{}
 	f.manualReset = true
 	f.state = StateCONFIRMING
 	f.nextWake = f.now()
@@ -183,7 +190,9 @@ func (f *AccountFSM) now() time.Time {
 func (f *AccountFSM) triggerTime(c Credit) time.Time { return c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime) }
 
 // armThreshold returns M = T - R (the moment we enter ARMED).
-func (f *AccountFSM) armThreshold(c Credit) time.Time { return f.triggerTime(c).Add(-f.Cfg.RefreshInterval) }
+func (f *AccountFSM) armThreshold(c Credit) time.Time {
+	return f.triggerTime(c).Add(-f.Cfg.RefreshInterval)
+}
 
 func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, details map[string]any) {
 	if f.Logf != nil {
@@ -191,11 +200,30 @@ func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, detai
 	}
 }
 
+// retryInterval is the configured retry cadence; a zero/negative value (an
+// unnormalized Config, e.g. in tests) falls back to the default.
+func (f *AccountFSM) retryInterval() time.Duration {
+	if f.Cfg.RetryInterval <= 0 {
+		return defaultRetryInterval
+	}
+	return f.Cfg.RetryInterval
+}
+
+// patrolRetryAt is when a failed patrol/confirmation looks again: the sooner
+// of the patrol interval and patrolErrorRetryInterval.
+func (f *AccountFSM) patrolRetryAt(now time.Time) time.Time {
+	d := f.Cfg.RefreshInterval
+	if d > patrolErrorRetryInterval {
+		d = patrolErrorRetryInterval
+	}
+	return now.Add(d)
+}
+
 func (f *AccountFSM) stepIDLE() time.Time {
 	now := f.now()
 	snap, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
-		next := now.Add(f.Cfg.RefreshInterval)
+		next := f.patrolRetryAt(now)
 		f.nextWake = next
 		f.log("warn", fmt.Sprintf("list failed: %v", err), "retry patrol", &next, nil)
 		return next
@@ -214,6 +242,8 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		f.log("info", "no available credits", "patrol", &next, nil)
 		return next
 	}
+	// Only credits WITH an expiry are ever scheduled automatically. Sorting
+	// puts never-expiring credits last, so avail[0] has the soonest expiry.
 	target := avail[0]
 	if target.ExpiresAt.IsZero() {
 		next := now.Add(f.Cfg.RefreshInterval)
@@ -222,19 +252,31 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		return next
 	}
 	M := f.armThreshold(target)
+	T := f.triggerTime(target)
 	if now.Before(M) {
 		next := now.Add(f.Cfg.RefreshInterval)
 		f.nextWake = next
 		f.log("info",
-			fmt.Sprintf("credit %s expires in %s; not near trigger window (will arm %s before expiry point)", shortID(target.ID), target.ExpiresAt.Sub(now).Round(time.Hour), f.Cfg.RefreshInterval),
+			fmt.Sprintf("credit %s expires in %s; not near trigger window (redeems %s before expiry)", shortID(target.ID), target.ExpiresAt.Sub(now).Round(time.Hour), formatDuration(f.Cfg.TriggerLeadTime)),
 			"patrol", &next,
 			map[string]any{"credit_id": target.ID, "expires_at": target.ExpiresAt})
 		return next
 	}
-	// now >= M -> ARMED. Sleep to T (or now if T already passed: late-start,
+	if f.Cfg.Paused {
+		// Paused: report what would happen, never arm. Patrol again within the
+		// trigger window so the UI stays current; resuming triggers a patrol.
+		next := now.Add(f.Cfg.RefreshInterval)
+		f.nextWake = next
+		f.log("warn",
+			fmt.Sprintf("automatic redeem is paused: credit %s expires at %s and will not be redeemed automatically", shortID(target.ID), target.ExpiresAt.Format(time.RFC3339)),
+			"patrol (paused)", &next,
+			map[string]any{"credit_id": target.ID, "expires_at": target.ExpiresAt, "T": T})
+		return next
+	}
+	// now >= M -> ARMED. Sleep to T (or now if T already passed: late start,
 	// spec §4.2.1). ARMED does NO extra GETs; it just transitions on wake.
-	T := f.triggerTime(target)
 	f.scheduledCreditID = target.ID
+	f.scheduledExpiresAt = target.ExpiresAt
 	f.state = StateARMED
 	wake := T
 	if !now.Before(T) {
@@ -242,9 +284,9 @@ func (f *AccountFSM) stepIDLE() time.Time {
 	}
 	f.nextWake = wake
 	f.log("warn",
-		fmt.Sprintf("credit %s armed; will reset at %s (expiry in %s)", shortID(target.ID), T.Format("15:04:05"), target.ExpiresAt.Sub(now).Round(time.Minute)),
+		fmt.Sprintf("credit %s armed; will reset at %s (expiry in %s)", shortID(target.ID), T.Format(time.RFC3339), target.ExpiresAt.Sub(now).Round(time.Minute)),
 		"sleep to trigger time", &wake,
-		map[string]any{"credit_id": target.ID, "T": T})
+		map[string]any{"credit_id": target.ID, "T": T, "expires_at": target.ExpiresAt})
 	return wake
 }
 
@@ -256,13 +298,41 @@ func (f *AccountFSM) stepARMED() time.Time {
 	return f.now() // re-enter immediately
 }
 
+// abandonAuto ends an automatic cycle without sending (another) consume.
+func (f *AccountFSM) abandonAuto(level, msg string) time.Time {
+	f.state = StateDONE
+	f.log(level, msg, "abandon", nil, map[string]any{"credit_id": f.scheduledCreditID})
+	return time.Time{}
+}
+
+// retryAutoConfirm schedules another confirmation of the SAME pinned credit
+// after retry_interval, or abandons when that would land at/after its expiry.
+func (f *AccountFSM) retryAutoConfirm(now time.Time, why string) time.Time {
+	next := now.Add(f.retryInterval())
+	if f.scheduledExpiresAt.IsZero() || !next.Before(f.scheduledExpiresAt) {
+		return f.abandonAuto("error", fmt.Sprintf("%s; credit %s expires at %s, before the next retry: giving up", why, shortID(f.scheduledCreditID), f.scheduledExpiresAt.Format(time.RFC3339)))
+	}
+	f.state = StateARMED
+	f.attempt = ResetAttempt{}
+	f.nextWake = next
+	f.log("warn", fmt.Sprintf("%s; retrying credit %s", why, shortID(f.scheduledCreditID)), "retry confirm", &next,
+		map[string]any{"credit_id": f.scheduledCreditID, "expires_at": f.scheduledExpiresAt})
+	return next
+}
+
 func (f *AccountFSM) stepCONFIRMING() time.Time {
 	now := f.now()
+	if !f.manualReset && f.Cfg.Paused {
+		return f.abandonAuto("warn", "automatic redeem is paused; armed cycle cancelled before any reset request")
+	}
 	snap, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
-		f.state = StateDONE
-		f.log("error", fmt.Sprintf("confirm list failed: %v", err), "abandon", nil, nil)
-		return time.Time{}
+		if f.manualReset {
+			f.state = StateDONE
+			f.log("error", fmt.Sprintf("confirm list failed: %v", err), "abandon", nil, nil)
+			return time.Time{}
+		}
+		return f.retryAutoConfirm(now, fmt.Sprintf("confirm list failed: %v", err))
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
 	var target Credit
@@ -280,7 +350,8 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 	}
 	if target.ID == "" {
 		f.state = StateDONE
-		f.log("warn", "target credit missing or unavailable before reset", "abandon", nil, nil)
+		f.log("warn", "target credit missing or unavailable before reset", "abandon", nil,
+			map[string]any{"credit_id": f.scheduledCreditID})
 		return time.Time{}
 	}
 	if !f.manualReset {
@@ -289,6 +360,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			f.log("info", "target credit no longer expires", "abandon", nil, nil)
 			return time.Time{}
 		}
+		f.scheduledExpiresAt = target.ExpiresAt
 		T := f.triggerTime(target)
 		if now.Before(T) {
 			f.state = StateARMED
@@ -305,14 +377,18 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 	// invariant would degrade to a two-leg check. Spec §4.2 mandates both calls.
 	usage, err := f.Client.GetUsage(f.Creds)
 	if err != nil {
-		f.state = StateDONE
-		f.log("error", fmt.Sprintf("confirm usage failed: %v", err), "abandon", nil, nil)
-		return time.Time{}
+		if f.manualReset {
+			f.state = StateDONE
+			f.log("error", fmt.Sprintf("confirm usage failed: %v", err), "abandon", nil, nil)
+			return time.Time{}
+		}
+		return f.retryAutoConfirm(now, fmt.Sprintf("confirm usage failed: %v", err))
 	}
 	snap.WeeklyPct = usage.WeeklyPct
 	f.attempt = ResetAttempt{
 		RedeemRequestID: uuid.NewString(),
 		TargetCreditID:  target.ID,
+		TargetExpiresAt: target.ExpiresAt,
 		PreSnapshot:     snap,
 		StartedAt:       now,
 		Attempt:         0,
@@ -323,17 +399,69 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			shortID(target.ID), snap.AvailableCount, snap.WeeklyPct),
 		"send reset request", nil,
 		map[string]any{
-			"credit_id":           target.ID,
-			"pre_credits":         snap.AvailableCount,
-			"pre_weekly_pct":      snap.WeeklyPct,
-			"target_expires_at":   target.ExpiresAt,
-			"redeem_request_id":   f.attempt.RedeemRequestID,
+			"credit_id":         target.ID,
+			"pre_credits":       snap.AvailableCount,
+			"pre_weekly_pct":    snap.WeeklyPct,
+			"target_expires_at": target.ExpiresAt,
+			"redeem_request_id": f.attempt.RedeemRequestID,
+			"manual":            f.manualReset,
 		})
 	return f.now()
 }
 
 func (f *AccountFSM) stepRESETTING() time.Time {
 	now := f.now()
+	auto := !f.manualReset
+	if f.Halted != nil && f.Halted() {
+		f.log("info", "worker stopping; reset request not sent (the restarted worker re-checks)", "none", nil, nil)
+		return time.Time{}
+	}
+	if f.attempt.Attempt > 0 {
+		// A retry: re-list first. If the pinned credit is gone, an earlier
+		// (ambiguous) attempt probably succeeded: verify instead of sending
+		// again. Otherwise refresh its expiry for the window checks below.
+		snap, err := f.Client.ListCredits(f.Creds)
+		if err != nil {
+			return f.scheduleConsumeRetry(now, auto, fmt.Errorf("re-list before retry: %w", err))
+		}
+		var found *Credit
+		for _, c := range availableCreditsSorted(snap.Credits, now) {
+			if c.ID == f.attempt.TargetCreditID {
+				c := c
+				found = &c
+				break
+			}
+		}
+		if found == nil {
+			f.state = StateVERIFYING
+			f.verifyDue = now
+			f.nextWake = now
+			f.log("warn", fmt.Sprintf("credit %s is no longer available before retry; verifying the earlier attempt instead of resending", shortID(f.attempt.TargetCreditID)),
+				"verify", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+			return now
+		}
+		if auto {
+			if found.ExpiresAt.IsZero() {
+				return f.abandonAuto("info", "target credit no longer expires; automatic retry cancelled")
+			}
+			f.attempt.TargetExpiresAt = found.ExpiresAt
+			f.scheduledExpiresAt = found.ExpiresAt
+		}
+	}
+	if auto {
+		// Defense in depth: an automatic consume is only ever sent for the
+		// pinned credit, inside [expiry - lead, expiry), and not while paused.
+		switch {
+		case f.attempt.TargetCreditID == "" || f.attempt.TargetCreditID != f.scheduledCreditID:
+			return f.abandonAuto("error", "internal: reset target does not match the armed credit; no request sent")
+		case f.Cfg.Paused:
+			return f.abandonAuto("warn", "automatic redeem is paused; no reset request sent")
+		case f.attempt.TargetExpiresAt.IsZero() || !now.Before(f.attempt.TargetExpiresAt):
+			return f.abandonAuto("error", fmt.Sprintf("credit %s expired before the reset request could be sent", shortID(f.attempt.TargetCreditID)))
+		case now.Before(f.attempt.TargetExpiresAt.Add(-f.Cfg.TriggerLeadTime)):
+			return f.abandonAuto("error", fmt.Sprintf("credit %s is not due yet; no reset request sent", shortID(f.attempt.TargetCreditID)))
+		}
+	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
 	switch classifyConsume(resp, err) {
 	case decisionSuccess:
@@ -351,6 +479,15 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 				"windows_reset":     resp.WindowsReset,
 			})
 		return f.verifyDue
+	case decisionNothingToReset:
+		msg := fmt.Sprintf("OpenAI answered nothing_to_reset for credit %s (no covered limit is low enough to restore); the credit was NOT used",
+			shortID(f.attempt.TargetCreditID))
+		if auto {
+			return f.retryAutoConfirm(now, msg)
+		}
+		f.state = StateDONE
+		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+		return time.Time{}
 	case decisionStop:
 		f.state = StateDONE
 		msg := fmt.Sprintf("reset stopped: server returned %s", resp.Code)
@@ -360,25 +497,40 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
 		return time.Time{}
 	case decisionRetry:
-		f.attempt.Attempt++
-		if f.attempt.Attempt > len(resetRetryDelays) {
-			f.state = StateDONE
-			f.log("error",
-				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
-				"abandon", nil,
-				map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
-			return time.Time{}
-		}
-		backoff := backoffForAttempt(f.attempt.Attempt)
-		f.attempt.NextRetryAt = now.Add(backoff)
-		f.nextWake = f.attempt.NextRetryAt
-		f.log("warn",
-			fmt.Sprintf("reset failed (attempt %d): %v; retrying with same idempotency key", f.attempt.Attempt, err),
-			fmt.Sprintf("retry in %v", backoff), &f.attempt.NextRetryAt,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "attempt": f.attempt.Attempt})
-		return f.attempt.NextRetryAt
+		return f.scheduleConsumeRetry(now, auto, err)
 	}
 	return time.Time{}
+}
+
+// scheduleConsumeRetry keeps the SAME redeem_request_id and target and retries
+// after retry_interval: automatic cycles until the credit's expiry, manual
+// resets at most manualMaxRetries times.
+func (f *AccountFSM) scheduleConsumeRetry(now time.Time, auto bool, err error) time.Time {
+	f.attempt.Attempt++
+	next := now.Add(f.retryInterval())
+	if auto && !next.Before(f.attempt.TargetExpiresAt) {
+		f.state = StateDONE
+		f.log("error",
+			fmt.Sprintf("reset failed (attempt %d): %v; credit expires before the next retry: giving up", f.attempt.Attempt, err),
+			"abandon", nil,
+			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+		return time.Time{}
+	}
+	if !auto && f.attempt.Attempt > manualMaxRetries {
+		f.state = StateDONE
+		f.log("error",
+			fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
+			"abandon", nil,
+			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+		return time.Time{}
+	}
+	f.attempt.NextRetryAt = next
+	f.nextWake = next
+	f.log("warn",
+		fmt.Sprintf("reset failed (attempt %d): %v; retrying with same idempotency key", f.attempt.Attempt, err),
+		fmt.Sprintf("retry in %v", f.retryInterval()), &f.attempt.NextRetryAt,
+		map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "attempt": f.attempt.Attempt})
+	return next
 }
 
 func (f *AccountFSM) stepVERIFYING() time.Time {
@@ -409,20 +561,21 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		}
 	}
 	countDown1 := credits.AvailableCount == f.attempt.PreSnapshot.AvailableCount-1
-	quotaUp := usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct
+	// Unknown (-1) post-reset quota never counts as recovered.
+	quotaUp := usage.WeeklyPct >= 0 && (usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
 
 	f.state = StateDONE
 	// Build detailed details map with full before/after snapshot.
 	details := map[string]any{
-		"credit_id":            f.attempt.TargetCreditID,
-		"redeem_request_id":    f.attempt.RedeemRequestID,
-		"pre_credits":          f.attempt.PreSnapshot.AvailableCount,
-		"post_credits":         credits.AvailableCount,
-		"pre_weekly_pct":       f.attempt.PreSnapshot.WeeklyPct,
-		"post_weekly_pct":      usage.WeeklyPct,
-		"target_gone":          targetGone,
-		"count_down_1":         countDown1,
-		"quota_recovered":      quotaUp,
+		"credit_id":         f.attempt.TargetCreditID,
+		"redeem_request_id": f.attempt.RedeemRequestID,
+		"pre_credits":       f.attempt.PreSnapshot.AvailableCount,
+		"post_credits":      credits.AvailableCount,
+		"pre_weekly_pct":    f.attempt.PreSnapshot.WeeklyPct,
+		"post_weekly_pct":   usage.WeeklyPct,
+		"target_gone":       targetGone,
+		"count_down_1":      countDown1,
+		"quota_recovered":   quotaUp,
 	}
 
 	success := targetGone && countDown1 && quotaUp
@@ -479,6 +632,7 @@ func (f *AccountFSM) resetLocked() {
 	f.verifyDue = time.Time{}
 	f.nextWake = time.Time{}
 	f.scheduledCreditID = ""
+	f.scheduledExpiresAt = time.Time{}
 	f.manualReset = false
 }
 

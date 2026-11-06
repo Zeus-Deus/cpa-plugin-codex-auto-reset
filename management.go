@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -29,7 +30,7 @@ type AccountOption struct {
 // routes from spec §9. The HTML resource page (Task 12) is rendered by
 // renderStatusHTML, called from the resource/status route.
 type managementHandlers struct {
-	mu                sync.Mutex
+	mu                *sync.Mutex // = &pluginStateMu: h.state IS globalState
 	state             *PluginState
 	statePath         string
 	worker            *Worker
@@ -38,7 +39,18 @@ type managementHandlers struct {
 }
 
 func newManagementHandlers(state *PluginState, statePath string, worker *Worker) *managementHandlers {
-	return &managementHandlers{state: state, statePath: statePath, worker: worker}
+	// Share pluginStateMu: h.state is the same *PluginState the worker mutates
+	// under that lock, so a private mutex here would allow concurrent map
+	// access (a fatal runtime error that crashes the host process).
+	return &managementHandlers{mu: &pluginStateMu, state: state, statePath: statePath, worker: worker}
+}
+
+// currentWorker reads h.worker under the state lock (restartWorkerFromState
+// swaps it under the same lock).
+func (h *managementHandlers) currentWorker() *Worker {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.worker
 }
 
 // resourceBasePath is the URL prefix under which CPA serves browser-navigable
@@ -79,22 +91,21 @@ func (h *managementHandlers) handle(method, rawPath string, headers http.Header,
 	case method == http.MethodGet && path == "/accounts":
 		st, b := h.accountsJSON()
 		return st, b, "application/json"
-	case method == http.MethodGet && path == "/debug/auth-list":
-		return h.debugAuthList()
-	case method == http.MethodGet && path == "/debug/usage":
-		return h.debugUsage()
 	case method == http.MethodGet && path == "/logs":
 		st, b := h.logsJSON()
 		return st, b, "application/json"
 	case method == http.MethodPut && path == "/settings":
 		st, b := h.putSettings(body)
 		return st, b, "application/json"
+	case method == http.MethodPut && path == "/paused":
+		st, b := h.putPaused(body)
+		return st, b, "application/json"
 	case method == http.MethodPost && path == "/check":
 		st, b := h.checkOne(body)
 		return st, b, "application/json"
 	case method == http.MethodPost && path == "/check/all":
-		if h.worker != nil {
-			if err := h.worker.TriggerCheck(""); err != nil {
+		if w := h.currentWorker(); w != nil {
+			if err := w.TriggerCheck(""); err != nil {
 				st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": err.Error()})
 				return st, b, "application/json"
 			}
@@ -163,99 +174,6 @@ func (h *managementHandlers) statusJSON() (int, []byte) {
 
 // accountsJSON returns the list of Codex accounts CPA knows about, annotated
 // with whether each is currently enabled. The UI renders these as checkboxes.
-// debugUsage fetches the raw /wham/usage response for the first enabled
-// account and returns it verbatim. Temporary diagnostic to determine the
-// real wire shape of weekly quota data.
-func (h *managementHandlers) debugUsage() (int, []byte, string) {
-	h.mu.Lock()
-	enabled := h.state.Config.EnabledAccounts
-	h.mu.Unlock()
-	if len(enabled) == 0 {
-		st, b := jsonStatus(http.StatusBadRequest, map[string]any{"error": "no enabled accounts"})
-		return st, b, "application/json"
-	}
-	if h.worker == nil {
-		st, b := jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "worker not running"})
-		return st, b, "application/json"
-	}
-	// Grab the first FSM's credentials + client.
-	var fsm *AccountFSM
-	h.worker.EachFSM(func(f *AccountFSM) {
-		if fsm == nil {
-			fsm = f
-		}
-	})
-	if fsm == nil {
-		st, b := jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "no FSM available"})
-		return st, b, "application/json"
-	}
-	// Do a raw HTTP GET to see the actual response body.
-	cli := &OpenAIClient{}
-	req, err := http.NewRequest(http.MethodGet, defaultBaseURL+usageEndpointPath, nil)
-	if err != nil {
-		st, b := jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return st, b, "application/json"
-	}
-	req.Header.Set("Authorization", "Bearer "+fsm.Creds.AccessToken)
-	if fsm.Creds.ChatGPTAccountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", fsm.Creds.ChatGPTAccountID)
-	}
-	req.Header.Set("User-Agent", codexUserAgent)
-	body, err := cli.do(req)
-	if err != nil {
-		st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": err.Error()})
-		return st, b, "application/json"
-	}
-	return http.StatusOK, body, "application/json"
-}
-
-// debugAuthList dumps the raw host.auth.list result with per-entry filter
-// diagnostics, so a remote deployment can see exactly why accounts are or
-// aren't matching the codex filter.
-func (h *managementHandlers) debugAuthList() (int, []byte, string) {
-	auths, err := listAuthsViaHost()
-	if err != nil {
-		st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": "host.auth.list: " + err.Error()})
-		return st, b, "application/json"
-	}
-	type diag struct {
-		ID           string `json:"id"`
-		AuthIndex    string `json:"auth_index"`
-		Provider     string `json:"provider"`
-		Type         string `json:"type"`
-		Name         string `json:"name"`
-		Email        string `json:"email"`
-		Disabled     bool   `json:"disabled"`
-		Unavailable  bool   `json:"unavailable"`
-		MatchesCodex bool   `json:"matches_codex"`
-		Skipped      string `json:"skipped_reason,omitempty"`
-	}
-	out := make([]diag, 0, len(auths))
-	for _, a := range auths {
-		d := diag{
-			ID:          a.ID,
-			AuthIndex:   a.AuthIndex,
-			Provider:    a.Provider,
-			Type:        a.Type,
-			Name:        a.Name,
-			Email:       a.Email,
-			Disabled:    a.Disabled,
-			Unavailable: a.Unavailable,
-		}
-		if strings.EqualFold(a.Provider, "codex") || strings.EqualFold(a.Type, "codex") {
-			d.MatchesCodex = true
-			if a.Disabled || a.Unavailable {
-				d.Skipped = "disabled/unavailable"
-			}
-		} else {
-			d.Skipped = "provider/type not codex"
-		}
-		out = append(out, d)
-	}
-	st, b := jsonOK(map[string]any{"total": len(auths), "entries": out})
-	return st, b, "application/json"
-}
-
 func (h *managementHandlers) accountsJSON() (int, []byte) {
 	if h.lister == nil {
 		return jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "account listing unavailable (host not wired)"})
@@ -278,45 +196,65 @@ func (h *managementHandlers) accountsJSON() (int, []byte) {
 	return jsonOK(map[string]any{"accounts": opts})
 }
 
+// putSettings updates the scheduling settings. Fields absent from the body
+// keep their current value (a partial PUT never wipes enabled_accounts).
+// The paused switch has its own route (PUT /paused) and is preserved here.
 func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	var req struct {
-		RefreshInterval string   `json:"refresh_interval"`
-		TriggerLeadTime string   `json:"trigger_lead_time"`
-		EnabledAccounts []string `json:"enabled_accounts"`
+		RefreshInterval *string   `json:"refresh_interval"`
+		TriggerLeadTime *string   `json:"trigger_lead_time"`
+		RetryInterval   *string   `json:"retry_interval"`
+		EnabledAccounts *[]string `json:"enabled_accounts"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		// Maybe it's YAML.
-		parsed, err2 := parseConfigYAML(body)
-		if err2 != nil {
-			return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid settings: " + err.Error()})
-		}
-		req.RefreshInterval = parsed.RefreshInterval.String()
-		req.TriggerLeadTime = parsed.TriggerLeadTime.String()
-		req.EnabledAccounts = parsed.EnabledAccounts
+		return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid settings: " + err.Error()})
 	}
 	h.mu.Lock()
-	// state_dir is operator-only (config_yaml); a UI save must not drop it.
-	cfg := Config{EnabledAccounts: req.EnabledAccounts, StateDir: h.state.Config.StateDir}
+	cfg := h.state.Config
+	cfg.EnabledAccounts = append([]string(nil), cfg.EnabledAccounts...)
 	h.mu.Unlock()
-	if req.RefreshInterval != "" {
-		d, err := time.ParseDuration(req.RefreshInterval)
-		if err != nil {
-			return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid refresh_interval: " + err.Error()})
+	parse := func(name string, raw *string, dst *time.Duration) error {
+		if raw == nil || strings.TrimSpace(*raw) == "" {
+			return nil
 		}
-		cfg.RefreshInterval = d
+		d, err := time.ParseDuration(strings.TrimSpace(*raw))
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", name, err)
+		}
+		if d < time.Minute {
+			return fmt.Errorf("invalid %s: must be at least 1m", name)
+		}
+		if name == "trigger_lead_time" && d > maxTriggerLeadTime {
+			return fmt.Errorf("invalid %s: at most %s", name, formatDuration(maxTriggerLeadTime))
+		}
+		if name == "retry_interval" && d > maxRetryInterval {
+			return fmt.Errorf("invalid %s: at most %s", name, formatDuration(maxRetryInterval))
+		}
+		*dst = d
+		return nil
 	}
-	if req.TriggerLeadTime != "" {
-		d, err := time.ParseDuration(req.TriggerLeadTime)
-		if err != nil {
-			return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid trigger_lead_time: " + err.Error()})
+	for _, f := range []struct {
+		name string
+		raw  *string
+		dst  *time.Duration
+	}{
+		{"refresh_interval", req.RefreshInterval, &cfg.RefreshInterval},
+		{"trigger_lead_time", req.TriggerLeadTime, &cfg.TriggerLeadTime},
+		{"retry_interval", req.RetryInterval, &cfg.RetryInterval},
+	} {
+		if err := parse(f.name, f.raw, f.dst); err != nil {
+			return jsonStatus(http.StatusBadRequest, map[string]any{"error": err.Error()})
 		}
-		cfg.TriggerLeadTime = d
+	}
+	if req.EnabledAccounts != nil {
+		cfg.EnabledAccounts = append([]string{}, (*req.EnabledAccounts)...)
 	}
 	cfg = normalizeConfig(cfg)
 	h.mu.Lock()
 	h.state.Config = cfg
+	err := saveState(h.statePath, h.state)
 	h.mu.Unlock()
-	if err := saveState(h.statePath, h.state); err != nil {
+	if err != nil {
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	}
 	// Restart the worker so the new config (especially enabled_accounts and
@@ -328,14 +266,44 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	return jsonOK(map[string]any{
 		"refresh_interval":  formatDuration(cfg.RefreshInterval),
 		"trigger_lead_time": formatDuration(cfg.TriggerLeadTime),
+		"retry_interval":    formatDuration(cfg.RetryInterval),
 		"enabled_accounts":  cfg.EnabledAccounts,
+		"paused":            cfg.Paused,
 	})
+}
+
+// putPaused switches automatic redemption off ({"paused": true}) or back on
+// ({"paused": false}). Persisted; applied to the running worker in place.
+func (h *managementHandlers) putPaused(body []byte) (int, []byte) {
+	var req struct {
+		Paused *bool `json:"paused"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Paused == nil {
+		return jsonStatus(http.StatusBadRequest, map[string]any{"error": `body must be {"paused": true|false}`})
+	}
+	h.mu.Lock()
+	h.state.Config.Paused = *req.Paused
+	err := saveState(h.statePath, h.state)
+	worker := h.worker
+	h.mu.Unlock()
+	if err != nil {
+		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	}
+	if worker != nil {
+		worker.SetPaused(*req.Paused)
+		msg := "automatic redeem resumed"
+		if *req.Paused {
+			msg = "automatic redeem paused (manual Reset still works)"
+		}
+		worker.Logs().append(LogEntry{Timestamp: time.Now(), Level: "warn", Scope: "system", Message: msg})
+	}
+	return jsonOK(map[string]any{"paused": *req.Paused})
 }
 
 func (h *managementHandlers) logsJSON() (int, []byte) {
 	var entries []LogEntry
-	if h.worker != nil {
-		entries = h.worker.Logs().all()
+	if w := h.currentWorker(); w != nil {
+		entries = w.Logs().all()
 	}
 	return jsonOK(map[string]any{"entries": entries})
 }
@@ -345,8 +313,8 @@ func (h *managementHandlers) checkOne(body []byte) (int, []byte) {
 		AuthIndex string `json:"auth_index"`
 	}
 	_ = json.Unmarshal(body, &req)
-	if h.worker != nil {
-		if err := h.worker.TriggerCheck(req.AuthIndex); err != nil {
+	if w := h.currentWorker(); w != nil {
+		if err := w.TriggerCheck(req.AuthIndex); err != nil {
 			return jsonStatus(http.StatusNotFound, map[string]any{"error": err.Error()})
 		}
 	}
@@ -360,8 +328,8 @@ func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
 	if err := json.Unmarshal(body, &req); err != nil || req.AuthIndex == "" {
 		return jsonStatus(http.StatusBadRequest, map[string]any{"error": "auth_index required"})
 	}
-	if h.worker != nil {
-		if err := h.worker.ForceConfirm(req.AuthIndex); err != nil {
+	if w := h.currentWorker(); w != nil {
+		if err := w.ForceConfirm(req.AuthIndex); err != nil {
 			return jsonStatus(http.StatusNotFound, map[string]any{"error": err.Error()})
 		}
 	}
@@ -387,9 +355,15 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 	h.mu.Lock()
 	h.state.Config = s.Config
 	h.state.Accounts = s.Accounts
+	err := saveState(h.statePath, h.state)
 	h.mu.Unlock()
-	if err := saveState(h.statePath, h.state); err != nil {
+	if err != nil {
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	}
+	// Apply the imported config to the running worker too (otherwise the
+	// UI would show one config while the old worker keeps another).
+	if h.OnSettingsChanged != nil {
+		h.OnSettingsChanged()
 	}
 	return jsonOK(map[string]any{"imported": true})
 }
@@ -730,11 +704,18 @@ func renderStatusHTML(state *PluginState) string {
         <section class="panel">
           <h2><span class="dot"></span><span data-i18n="settings">Settings</span></h2>
           <div class="field-stack">
+            <label class="toggle"><span data-i18n="autoRedeem">Automatic redeem</span>
+              <input id="autoRedeemToggle" type="checkbox" disabled>
+            </label>
+            <p class="setting-help" data-i18n="autoRedeemHelp">Off: no credit is redeemed automatically (patrols continue, manual Reset still works). Applies immediately.</p>
             <label class="field"><span data-i18n="refreshInterval">Refresh interval</span>
-              <input id="refreshInterval" placeholder="12h" spellcheck="false">
+              <input id="refreshInterval" placeholder="6h" spellcheck="false">
             </label>
             <label class="field"><span data-i18n="triggerLeadTime">Trigger lead time</span>
-              <input id="triggerLeadTime" placeholder="6h" spellcheck="false">
+              <input id="triggerLeadTime" placeholder="1h" spellcheck="false">
+            </label>
+            <label class="field"><span data-i18n="retryInterval">Retry interval</span>
+              <input id="retryInterval" placeholder="10m" spellcheck="false">
             </label>
             <div>
               <div style="font-size:12px; font-weight:600; margin-bottom:6px;" data-i18n="enabledAccounts">Enabled accounts</div>
@@ -781,6 +762,11 @@ func renderStatusHTML(state *PluginState) string {
         refresh: "Refresh",
         refreshInterval: "Refresh interval",
         triggerLeadTime: "Trigger lead time",
+        retryInterval: "Retry interval",
+        autoRedeem: "Automatic redeem",
+        autoRedeemHelp: "Off: no credit is redeemed automatically (patrols continue, manual Reset still works). Applies immediately.",
+        autoRedeemOn: "Automatic redeem is on.",
+        autoRedeemOff: "Automatic redeem is paused.",
         enabledAccounts: "Enabled accounts",
         allAccounts: "All accounts (automatic)",
         allAccountsHelp: "Includes every Codex account CPA knows, now and in the future. Uncheck to pick accounts individually.",
@@ -1274,6 +1260,10 @@ func renderStatusHTML(state *PluginState) string {
         const c = status.config || {};
         document.getElementById('refreshInterval').value = (c.refresh_interval || '').toString();
         document.getElementById('triggerLeadTime').value = (c.trigger_lead_time || '').toString();
+        document.getElementById('retryInterval').value = (c.retry_interval || '').toString();
+        const ar = document.getElementById('autoRedeemToggle');
+        ar.checked = !c.paused;
+        ar.disabled = false;
         currentAccounts = acctsResp.accounts || [];
         allAccountsMode = (c.enabled_accounts || []).indexOf('*') !== -1;
         renderAccountCheckboxes(currentAccounts);
@@ -1314,10 +1304,25 @@ func renderStatusHTML(state *PluginState) string {
         await apiSend('PUT', '/v0/management/plugins/codex-auto-reset/settings', {
           refresh_interval: document.getElementById('refreshInterval').value.trim(),
           trigger_lead_time: document.getElementById('triggerLeadTime').value.trim(),
+          retry_interval: document.getElementById('retryInterval').value.trim(),
           enabled_accounts: getEnabledAccounts()
         });
         alert(t('settingsSaved'));
       } catch (e) { alert(e.message); }
+    }
+    async function setAutoRedeem(on) {
+      const ar = document.getElementById('autoRedeemToggle');
+      ar.disabled = true;
+      try {
+        await apiSend('PUT', '/v0/management/plugins/codex-auto-reset/paused', { paused: !on });
+        await loadStatus();
+        alert(t(on ? 'autoRedeemOn' : 'autoRedeemOff'));
+      } catch (e) {
+        ar.checked = !on;
+        alert(e.message);
+      } finally {
+        ar.disabled = false;
+      }
     }
     async function checkOne(id) {
       try { await apiSend('POST', '/v0/management/plugins/codex-auto-reset/check', { auth_index: id }); await loadStatus(); }
@@ -1393,6 +1398,7 @@ func renderStatusHTML(state *PluginState) string {
       document.getElementById('refresh').addEventListener('click', loadStatus);
       document.getElementById('load').addEventListener('click', function () { syncRememberedKey(); loadStatus(); });
       document.getElementById('saveSettings').addEventListener('click', saveSettings);
+      document.getElementById('autoRedeemToggle').addEventListener('change', function () { setAutoRedeem(this.checked); });
       // "All accounts" toggle: switching it re-renders the account checkboxes
       // between wildcard preview (all checked, disabled) and per-account picks.
       document.getElementById('allAccountsToggle').addEventListener('change', function () {

@@ -53,6 +53,8 @@ type Worker struct {
 	stopCh  chan struct{}
 	wakeCh  chan struct{} // wakes the sleeping loop when a manual trigger changes nextWake
 	stopped bool
+	running bool          // Run started (doneCh will be closed when it returns)
+	doneCh  chan struct{} // closed when Run returns
 
 	// missingRetryAt records when each enabled account whose credentials last
 	// failed to load should be retried. Without it, an account that fails its
@@ -87,7 +89,7 @@ func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() ti
 		cfg: cfg, enabled: enabled, resolvedEnabled: static, loader: loader, nowFn: nowFn,
 		fsms: map[string]*AccountFSM{}, missingRetryAt: map[string]time.Time{},
 		logs:   newLogRing(maxLogEntries),
-		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1), doneCh: make(chan struct{}),
 	}
 }
 
@@ -143,6 +145,60 @@ func (w *Worker) Stop() {
 	w.stopped = true
 	close(w.stopCh)
 	w.mu.Unlock()
+}
+
+// isStopped reports whether Stop was called. FSMs consult it right before a
+// consume so a replaced worker never sends one after its successor started.
+func (w *Worker) isStopped() bool {
+	select {
+	case <-w.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// StopAndWait stops the worker and waits (bounded) for Run to return, i.e.
+// for any in-flight step to finish. Must not be called with pluginStateMu
+// held: the finishing step's StateSync takes it.
+func (w *Worker) StopAndWait(timeout time.Duration) {
+	w.Stop()
+	w.mu.Lock()
+	started := w.running
+	w.mu.Unlock()
+	if !started {
+		return
+	}
+	select {
+	case <-w.doneCh:
+	case <-time.After(timeout):
+		w.logs.append(LogEntry{Timestamp: w.nowFn(), Level: "warn", Scope: "system",
+			Message: "previous worker still busy after stop timeout; it will not send another reset request"})
+	}
+}
+
+// SetPaused switches automatic redemption off or on without restarting the
+// worker (an in-flight verification keeps running). Paused FSMs abandon an
+// armed or retrying automatic cycle at their next step, before any consume;
+// manual resets are unaffected. Resuming pulls IDLE accounts to an immediate
+// patrol so a credit already inside its trigger window is redeemed right away.
+func (w *Worker) SetPaused(paused bool) {
+	w.mu.Lock()
+	w.cfg.Paused = paused
+	fsms := make([]*AccountFSM, 0, len(w.fsms))
+	for _, f := range w.fsms {
+		fsms = append(fsms, f)
+	}
+	w.mu.Unlock()
+	for _, f := range fsms {
+		f.mu.Lock()
+		f.Cfg.Paused = paused
+		f.mu.Unlock()
+	}
+	if !paused {
+		_ = w.TriggerCheck("")
+	}
+	w.wake()
 }
 
 // TriggerCheck pulls IDLE accounts to an immediate patrol (nextWake=now,
@@ -205,6 +261,10 @@ func (w *Worker) ForceConfirm(authID string) error {
 // accounts forever. The panicking account gets its nextWake pushed forward
 // and the loop continues.
 func (w *Worker) Run() {
+	w.mu.Lock()
+	w.running = true
+	w.mu.Unlock()
+	defer close(w.doneCh)
 	defer func() {
 		if r := recover(); r != nil {
 			// This should never happen — the inner recover should catch per-account
@@ -246,7 +306,7 @@ func (w *Worker) Run() {
 			if w.testAccelerate {
 				w.advanceClock(w.nowFn().Add(delay))
 			} else {
-				w.sleepOrStop(delay)
+				w.sleepOrStop(capSleep(delay))
 			}
 			continue
 		}
@@ -255,7 +315,11 @@ func (w *Worker) Run() {
 			if w.testAccelerate {
 				w.advanceClock(nextWake)
 			} else {
-				w.sleepOrStop(nextWake.Sub(now))
+				// Sleep in short slices: wildcard re-resolution, credential
+				// retries for other accounts and wall-clock jumps (NTP step,
+				// container pause) are re-evaluated at least every
+				// maxLoopSleep instead of after a multi-hour timer.
+				w.sleepOrStop(capSleep(nextWake.Sub(now)))
 			}
 			continue
 		}
@@ -344,12 +408,18 @@ func (w *Worker) ensureFSM(id string) {
 		})
 		return
 	}
-	fsm := NewAccountFSM(id, creds, w.cfg, client, w.nowFn, w.makeLogFn(id))
+	w.mu.Lock()
+	cfg := w.cfg
+	w.mu.Unlock()
+	fsm := NewAccountFSM(id, creds, cfg, client, w.nowFn, w.makeLogFn(id))
+	fsm.Halted = w.isStopped
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
 	fsm.SetNextWake(w.nowFn())
 	w.mu.Lock()
 	if _, ok := w.fsms[id]; !ok {
+		// Not shared yet: pick up a SetPaused that ran since cfg was copied.
+		fsm.Cfg.Paused = w.cfg.Paused
 		w.fsms[id] = fsm
 		delete(w.missingRetryAt, id)
 	}
@@ -457,7 +527,7 @@ func (w *Worker) nextMissingRetryDelay() time.Duration {
 		}
 	}
 	if soonest.IsZero() {
-		return 100 * time.Millisecond // no enabled accounts; idle politely
+		return maxLoopSleep // no enabled accounts; manual triggers still wake the loop
 	}
 	return soonest.Sub(now)
 }
@@ -487,6 +557,16 @@ func (w *Worker) soonest() (string, time.Time) {
 		}
 	}
 	return bestID, best
+}
+
+// maxLoopSleep caps one Run-loop sleep (see Run).
+const maxLoopSleep = time.Minute
+
+func capSleep(d time.Duration) time.Duration {
+	if d > maxLoopSleep {
+		return maxLoopSleep
+	}
+	return d
 }
 
 func (w *Worker) sleepOrStop(d time.Duration) {

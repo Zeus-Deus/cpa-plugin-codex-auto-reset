@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,7 +26,14 @@ const defaultBaseURL = "https://chatgpt.com"
 // A finite Timeout is mandatory: the worker goroutine drives one FSM per
 // account synchronously, so a hung TCP connection against chatgpt.com would
 // otherwise park that account permanently (spec §3.3, §6.1).
-var openAIDefaultHTTP = &http.Client{Timeout: 30 * time.Second}
+// Redirects are refused: the bearer token, account header and consume body
+// must only ever reach the three documented chatgpt.com endpoints.
+var openAIDefaultHTTP = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // HTTPStatusError carries the status code of a non-2xx response so callers
 // (notably the retry classifier in retry.go) can distinguish 4xx (hard stop)
@@ -41,10 +50,28 @@ func (e *HTTPStatusError) Error() string {
 }
 
 // IsClientError reports whether err is a 4xx HTTPStatusError (bad request,
-// bad token, etc.) — such errors should NOT be retried.
+// bad token, etc.).
 func IsClientError(err error) bool {
 	var se *HTTPStatusError
 	return errors.As(err, &se) && se.Code >= 400 && se.Code < 500
+}
+
+// IsPermanentClientError reports a 4xx that retrying cannot fix (malformed
+// request, unknown route, unprocessable body). 401/403 (token mid-refresh or an
+// edge challenge), 408, 409, 425 and 429 are treated as transient: credentials
+// are reloaded from CPA before every attempt, and every retry still targets the
+// same pinned credit.
+func IsPermanentClientError(err error) bool {
+	var se *HTTPStatusError
+	if !errors.As(err, &se) || se.Code < 400 || se.Code >= 500 {
+		return false
+	}
+	switch se.Code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout,
+		http.StatusConflict, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	}
+	return true
 }
 
 func (c *OpenAIClient) baseURL() string {
@@ -89,7 +116,20 @@ func (c *OpenAIClient) setAuthHeaders(req *http.Request, creds CodexCredentials)
 	if creds.ChatGPTAccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", creds.ChatGPTAccountID)
 	}
-	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("User-Agent", userAgent())
+}
+
+// configuredUserAgent holds the operator's config_yaml `user_agent` override
+// (empty = codexUserAgent). Set on plugin (re)configure.
+var configuredUserAgent atomic.Value // string
+
+func setUserAgent(ua string) { configuredUserAgent.Store(strings.TrimSpace(ua)) }
+
+func userAgent() string {
+	if ua, _ := configuredUserAgent.Load().(string); ua != "" {
+		return ua
+	}
+	return codexUserAgent
 }
 
 // ListCredits calls GET /backend-api/wham/rate-limit-reset-credits.

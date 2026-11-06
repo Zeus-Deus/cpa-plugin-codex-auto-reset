@@ -9,11 +9,17 @@ import (
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.RefreshInterval != 12*time.Hour {
+	if cfg.RefreshInterval != 6*time.Hour {
 		t.Fatalf("R = %v", cfg.RefreshInterval)
 	}
-	if cfg.TriggerLeadTime != 6*time.Hour {
+	if cfg.TriggerLeadTime != 1*time.Hour {
 		t.Fatalf("L = %v", cfg.TriggerLeadTime)
+	}
+	if cfg.RetryInterval != 10*time.Minute {
+		t.Fatalf("retry = %v", cfg.RetryInterval)
+	}
+	if cfg.Paused {
+		t.Fatal("default must not be paused")
 	}
 	// Fresh installs enable every Codex account via the wildcard.
 	if len(cfg.EnabledAccounts) != 1 || cfg.EnabledAccounts[0] != allAccountsWildcard {
@@ -46,8 +52,8 @@ func TestParseConfigYAML_Empty(t *testing.T) {
 	}
 	// Empty YAML should yield defaults (normalization kicks in), including
 	// the all-accounts wildcard for a fresh install.
-	if cfg.RefreshInterval != 12*time.Hour {
-		t.Fatalf("empty R should default, got %v", cfg.RefreshInterval)
+	if cfg.RefreshInterval != 6*time.Hour || cfg.TriggerLeadTime != time.Hour || cfg.RetryInterval != 10*time.Minute {
+		t.Fatalf("empty yaml should default, got %+v", cfg)
 	}
 	if !configEnablesAll(cfg.EnabledAccounts) {
 		t.Fatalf("empty yaml enabled = %v, want wildcard", cfg.EnabledAccounts)

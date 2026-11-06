@@ -38,8 +38,11 @@ type Snapshot struct {
 // RedeemRequestID is minted on entry to RESETTING and reused for every retry
 // in that cycle, so OpenAI dedupes and never double-consumes.
 type ResetAttempt struct {
-	RedeemRequestID string    `json:"redeem_request_id"`
-	TargetCreditID  string    `json:"target_credit_id"`
+	RedeemRequestID string `json:"redeem_request_id"`
+	TargetCreditID  string `json:"target_credit_id"`
+	// TargetExpiresAt is the pinned credit's expiry (zero for a manual reset
+	// of a non-expiring credit). Automatic attempts never run at or after it.
+	TargetExpiresAt time.Time `json:"target_expires_at"`
 	PreSnapshot     Snapshot  `json:"pre_snapshot"`
 	StartedAt       time.Time `json:"started_at"`
 	Attempt         int       `json:"attempt"`

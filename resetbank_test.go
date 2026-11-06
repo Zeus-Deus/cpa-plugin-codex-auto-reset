@@ -34,6 +34,13 @@ type fakeClient struct {
 	// server-side deduction — used to script the wrong-credit bug.
 	deductCreditID string
 
+	// consumeScript, when non-empty, supplies the next consume responses in
+	// order (after failFirstN); consumeResp applies once it is exhausted.
+	consumeScript []ConsumeResponse
+	// clock, when set, records the fake time of every consume call.
+	clock        *fakeClock
+	consumeTimes []time.Time
+
 	// keepQuotaAtPre, when true, makes Consume deduct the credit WITHOUT
 	// bumping weeklyPct to 100 — scripts a broken/stale server where the
 	// reset succeeds on the credit leg but the quota does not recover.
@@ -62,6 +69,9 @@ func (f *fakeClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRespo
 	f.consumeCalls++
 	f.consumeIDs = append(f.consumeIDs, cid)
 	f.redeemIDs = append(f.redeemIDs, rrid)
+	if f.clock != nil {
+		f.consumeTimes = append(f.consumeTimes, f.clock.t)
+	}
 
 	// Transient-failure injection takes precedence so a failed attempt does
 	// NOT mutate server state (matches sim/engine.go's ordering).
@@ -72,8 +82,13 @@ func (f *fakeClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRespo
 	if f.consumeErr != nil {
 		return ConsumeResponse{}, f.consumeErr
 	}
+	resp := f.consumeResp
+	if len(f.consumeScript) > 0 {
+		resp = f.consumeScript[0]
+		f.consumeScript = f.consumeScript[1:]
+	}
 	// Server-side deduction on success-equivalent codes.
-	if f.consumeResp.Code == ConsumeCodeReset || f.consumeResp.Code == ConsumeCodeAlreadyRedeemed {
+	if resp.Code == ConsumeCodeReset || resp.Code == ConsumeCodeAlreadyRedeemed {
 		deductID := cid
 		if f.deductCreditID != "" {
 			deductID = f.deductCreditID
@@ -85,7 +100,7 @@ func (f *fakeClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRespo
 			f.weeklyPct = 100
 		}
 	}
-	return f.consumeResp, nil
+	return resp, nil
 }
 
 func countAvail(cs []Credit) int {
@@ -218,11 +233,11 @@ func TestFSM_AlreadyRedeemed_TreatedAsSuccess(t *testing.T) {
 }
 
 // TestFSM_RetriesExhausted_GivesUp: Consume always returns a network error.
-// Expect 6 POSTs (1 initial + 5 retries), all with the same UUID, then DONE
-// with the credit NOT redeemed.
+// With a 1h lead and 10m retries, expect 6 POSTs (T, T+10m .. T+50m), all with
+// the same UUID, then DONE before expiry with the credit NOT redeemed.
 func TestFSM_RetriesExhausted_GivesUp(t *testing.T) {
 	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
-	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: time.Hour, RetryInterval: 10 * time.Minute}
 	fc := &fakeClient{
 		credits:    map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
 		weeklyPct:  20,
@@ -238,7 +253,7 @@ func TestFSM_RetriesExhausted_GivesUp(t *testing.T) {
 		t.Fatalf("final state = %s, want DONE", fsm.State())
 	}
 	if fc.consumeCalls != 6 {
-		t.Fatalf("consume calls = %d, want 6 (1 + 5 retries)", fc.consumeCalls)
+		t.Fatalf("consume calls = %d, want 6 (T, then every 10m until expiry)", fc.consumeCalls)
 	}
 	first := fc.redeemIDs[0]
 	for i, id := range fc.redeemIDs {
@@ -334,8 +349,8 @@ func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
 			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
 			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
 		},
-		weeklyPct:     25,
-		consumeResp:   ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		weeklyPct:      25,
+		consumeResp:    ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 		deductCreditID: "later", // server bug: deducts the wrong credit
 	}
 	clock := &fakeClock{t: E1.Add(-12 * time.Hour)}

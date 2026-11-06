@@ -13,11 +13,11 @@ const (
 
 // codexUserAgent mirrors the value used by Cli-Proxy-API-Management-Center
 // (spec §2.2). The codex_cli_rs/<version> prefix is the load-bearing part.
+// Operators can override it with config_yaml `user_agent` (see userAgent()).
 const codexUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 
-// Hardcoded scheduling/retry/log parameters (spec §7.2). None are user-tunable.
-// resetRetryDelays must be a var because Go does not permit const slices;
-// every other value here is a true const.
+// Hardcoded scheduling/log parameters (spec §7.2). None are user-tunable; the
+// retry cadence is the user-tunable retry_interval (config.go).
 const (
 	postResetVerifyDelay = 1 * time.Minute
 	maxLogEntries        = 1000
@@ -35,10 +35,12 @@ const (
 	wildcardResolveInterval = 1 * time.Minute
 )
 
-var resetRetryDelays = []time.Duration{
-	1 * time.Minute,
-	2 * time.Minute,
-	5 * time.Minute,
-	10 * time.Minute,
-	30 * time.Minute,
-}
+// manualMaxRetries caps transient-error retries of a manual Reset (which may
+// target a credit with no expiry, so expiry cannot bound it). Automatic cycles
+// are bounded by the pinned credit's expiry instead.
+const manualMaxRetries = 5
+
+// patrolErrorRetryInterval caps how long a failed patrol or pre-reset
+// confirmation waits before trying again, so one network blip near a credit's
+// trigger time cannot push the next look past its expiry.
+const patrolErrorRetryInterval = 30 * time.Minute

@@ -77,7 +77,7 @@ var (
 	// dir). All saves go through it so reconfigure cannot split state
 	// across locations.
 	globalStatePath string
-	pluginVersion   = "0.1.14"
+	pluginVersion   = "0.1.14-zd.1"
 )
 
 func main() {}
@@ -96,7 +96,20 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (ret C.int) {
+	// The plugin runs its own Go runtime inside CPA: a panic escaping this
+	// cgo entry point cannot be recovered by the host and would abort the
+	// whole proxy. Convert it into an error envelope instead.
+	defer func() {
+		if r := recover(); r != nil {
+			if response != nil {
+				response.ptr = nil
+				response.len = 0
+			}
+			writeResponse(response, errorEnvelope("plugin_panic", fmt.Sprint(r)))
+			ret = 1
+		}
+	}()
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
@@ -127,13 +140,22 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	defer func() { _ = recover() }()
 	pluginStateMu.Lock()
 	w := globalWorker
+	path := globalStatePath
 	pluginStateMu.Unlock()
 	if w != nil {
-		w.Stop()
+		w.StopAndWait(shutdownWait)
+	}
+	if path != "" {
+		_ = SaveStateNow(path)
 	}
 }
+
+// shutdownWait bounds how long shutdown/reconfigure waits for an in-flight
+// worker step (at most a couple of 30s HTTP calls) before moving on.
+const shutdownWait = 45 * time.Second
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
@@ -278,6 +300,15 @@ func configurePlugin(raw []byte) error {
 		cfg = parsed
 	}
 
+	// Stop a previous worker (reconfigure) and wait for its in-flight step
+	// before taking the state lock; see restartWorkerFromState.
+	pluginStateMu.Lock()
+	prev := globalWorker
+	pluginStateMu.Unlock()
+	if prev != nil {
+		prev.StopAndWait(shutdownWait)
+	}
+
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
 
@@ -286,6 +317,7 @@ func configurePlugin(raw []byte) error {
 	// but rarely the OS user-config dir, so keying state off the auth dir is
 	// what makes it survive image updates and container recreates.
 	yamlStateDir := strings.TrimSpace(cfg.StateDir)
+	yamlUserAgent := strings.TrimSpace(cfg.UserAgent)
 	authEntries, authListErr := listAuthsViaHost()
 	statePath := resolveStatePath(yamlStateDir, authEntries)
 	globalStatePath = statePath
@@ -304,13 +336,18 @@ func configurePlugin(raw []byte) error {
 		// Fresh state: use the config we just parsed.
 		loaded.Config = cfg
 	} else {
-		cfg = loaded.Config
+		// Older state files lack retry_interval; normalize fills defaults.
+		cfg = normalizeConfig(loaded.Config)
 	}
 	// The config_yaml override is authoritative for state_dir across
 	// state.json round-trips (a fresh save persists it for later boots).
 	if yamlStateDir != "" {
 		cfg.StateDir = yamlStateDir
 	}
+	// user_agent is operator-only and, like state_dir, comes from config_yaml
+	// on every load (it is never persisted in state.json).
+	cfg.UserAgent = yamlUserAgent
+	setUserAgent(yamlUserAgent)
 	globalState = loaded
 	globalState.Config = cfg
 
@@ -374,10 +411,19 @@ func configurePlugin(raw []byte) error {
 // PUT /settings so config changes (enabled_accounts, refresh_interval) take
 // effect immediately instead of requiring a plugin reload.
 func restartWorkerFromState() {
+	// Stop the old worker and wait for its in-flight step OUTSIDE the state
+	// lock (its StateSync takes pluginStateMu), so two workers never run
+	// steps for the same account at once.
+	pluginStateMu.Lock()
+	old := globalWorker
+	pluginStateMu.Unlock()
+	if old != nil {
+		old.StopAndWait(shutdownWait)
+	}
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
-	if globalWorker != nil {
-		globalWorker.Stop()
+	if globalWorker != nil && globalWorker != old {
+		globalWorker.Stop() // a concurrent restart won; replace it too
 	}
 	cfg := globalState.Config
 	w := NewWorker(cfg, cfg.EnabledAccounts, hostCredsLoader, time.Now)
@@ -535,7 +581,7 @@ func pluginRegistration() registration {
 			Name:             "Codex Auto Reset",
 			Version:          pluginVersion,
 			Author:           "Jeffery",
-			GitHubRepository: "https://github.com/JefferyZhang2019/cpa-plugin-codex-auto-reset",
+			GitHubRepository: "https://github.com/Zeus-Deus/cpa-plugin-codex-auto-reset",
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
 	}
@@ -806,8 +852,9 @@ func collapseResetHistoryDuplicates(state *PluginState) {
 const stateSyncPersistInterval = 5 * time.Second
 
 var (
-	lastStatePersistMu sync.Mutex
-	lastStatePersist   time.Time
+	lastStatePersistMu     sync.Mutex
+	lastStatePersist       time.Time
+	trailingPersistPending bool
 )
 
 // debouncedSaveState writes state to disk at most once per
@@ -815,16 +862,25 @@ var (
 // FSM step. A final write on shutdown is handled by SaveStateNow.
 func debouncedSaveState(path string) {
 	lastStatePersistMu.Lock()
-	if time.Since(lastStatePersist) < stateSyncPersistInterval {
+	if wait := stateSyncPersistInterval - time.Since(lastStatePersist); wait > 0 {
+		// Inside the debounce window: schedule one trailing write so the
+		// latest change is not lost until the next step (hours away).
+		if !trailingPersistPending {
+			trailingPersistPending = true
+			time.AfterFunc(wait, func() {
+				defer func() { _ = recover() }()
+				lastStatePersistMu.Lock()
+				trailingPersistPending = false
+				lastStatePersistMu.Unlock()
+				_ = SaveStateNow(path)
+			})
+		}
 		lastStatePersistMu.Unlock()
 		return
 	}
 	lastStatePersist = time.Now()
 	lastStatePersistMu.Unlock()
-	pluginStateMu.Lock()
-	snapshot := globalState
-	pluginStateMu.Unlock()
-	_ = saveState(path, snapshot)
+	_ = SaveStateNow(path)
 }
 
 // SaveStateNow forces an immediate persist (used on shutdown / reconfigure).
@@ -832,10 +888,17 @@ func SaveStateNow(path string) error {
 	lastStatePersistMu.Lock()
 	lastStatePersist = time.Now()
 	lastStatePersistMu.Unlock()
+	// Marshal under the state lock: globalState's maps are mutated by the
+	// worker and management handlers, and a concurrent map read during JSON
+	// encoding is a fatal (unrecoverable) runtime error that would take the
+	// whole CPA process down. Only the file write happens outside the lock.
 	pluginStateMu.Lock()
-	snapshot := globalState
+	raw, err := json.MarshalIndent(globalState, "", "  ")
 	pluginStateMu.Unlock()
-	return saveState(path, snapshot)
+	if err != nil {
+		return err
+	}
+	return writeStateFile(path, raw)
 }
 
 var _ = strings.TrimSpace

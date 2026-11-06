@@ -1,3 +1,33 @@
+> **Fork (Zeus-Deus).** This fork is built from source and loaded into a private CLIProxyAPI
+> v8.0.51; it is not published to the plugin store. Differences from upstream v0.1.14:
+>
+> - **Defaults:** redeem **1h** before expiry (`trigger_lead_time`, max 24h), patrol every 6h, and retry
+>   the same pinned credit every **10m** (`retry_interval`, 1m to 1h) until it expires.
+> - **Retries stay on the pinned credit.** Transient errors (network, 5xx, 401/403/408/409/425/429,
+>   redirects) reuse the same `redeem_request_id`. Before each retry the credit is listed again; if it is
+>   gone, the earlier attempt is verified instead of sending another request. `nothing_to_reset` (no
+>   covered limit low enough, so the credit is kept) is retried with a new `redeem_request_id` after
+>   confirming the same credit is still available. Errors while confirming also retry inside the window
+>   instead of dropping the cycle. Automatic requests are only ever sent inside `[expiry - lead, expiry)`.
+>   Manual resets still stop on `nothing_to_reset` and retry transient errors at most 5 times.
+> - **Pause switch:** `PUT /v0/management/plugins/codex-auto-reset/paused` with `{"paused": true|false}`,
+>   plus an "Automatic redeem" toggle in the UI. It is saved to disk and survives restarts. While paused,
+>   patrols keep running read-only, armed or retrying cycles are cancelled before any request, and a manual
+>   Reset still works. Resuming patrols right away.
+> - **Stability:** one state lock shared by the worker and the management handlers (upstream could hit
+>   Go's fatal concurrent-map error and crash the proxy). `recover` at the cgo entry point. A replaced worker
+>   is stopped and joined, and never sends a consume after stopping. State writes are serialised, with a
+>   trailing write after debounce. The run loop sleeps at most 1 minute at a time (it used to sleep hours,
+>   and spun every 100ms when idle).
+> - **Safer parsing and verification:** an unknown weekly quota is `-1`, never counted as recovered. An
+>   unparseable `expires_at` is never targeted (it is not treated as "never expires").
+> - `PUT /settings` updates only the fields you send. Import applies its config to the running worker.
+>   The debug routes are removed, redirects are refused, and the SDK is pinned to the host's v8.0.51.
+> - `user_agent` is an operator-only `config_yaml` override (default unchanged).
+> - Note: the UI's opt-in "Remember management key" stores the key in this browser's localStorage.
+>
+> Tests: `go test -race ./...` and `cd sim && go test ./...` (see `fork_test.go`).
+
 # Codex Auto Reset
 
 `codex-auto-reset` is a CLIProxyAPI (CPA) dynamic library plugin that
