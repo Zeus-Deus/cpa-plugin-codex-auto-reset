@@ -143,7 +143,7 @@ const (
 
 	// An automatic redeem must stay "about to expire": at most 2h early.
 	maxTriggerLeadTime = 2 * time.Hour
-	maxRetryInterval   = time.Hour
+	maxRetryInterval   = 30 * time.Minute // at least two tries inside a 1h window
 	maxRefreshInterval = 24 * time.Hour
 )
 

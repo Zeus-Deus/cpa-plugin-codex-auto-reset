@@ -306,6 +306,10 @@ func (h *managementHandlers) putPaused(body []byte) (int, []byte) {
 	h.applyMu.Lock()
 	defer h.applyMu.Unlock()
 	h.mu.Lock()
+	if !*req.Paused && forcedPaused.Load() { // re-check: a reload may have set it meanwhile
+		h.mu.Unlock()
+		return jsonStatus(http.StatusConflict, map[string]any{"error": "paused by config_yaml (paused: true); remove it from CPA's plugin config to resume"})
+	}
 	h.state.Config.Paused = *req.Paused
 	err := saveState(h.statePath, h.state)
 	worker := h.worker

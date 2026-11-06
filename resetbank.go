@@ -99,6 +99,16 @@ func (f *AccountFSM) LastSnapshot() Snapshot {
 	return f.lastSnapshot
 }
 
+// PullPatrolIfIdle schedules an immediate patrol if the FSM is IDLE (checked
+// and written under one lock hold). Active cycles keep their schedule.
+func (f *AccountFSM) PullPatrolIfIdle(now time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == StateIDLE {
+		f.nextWake = now
+	}
+}
+
 // SetNextWake lets external callers (worker's TriggerCheck) override the
 // scheduled wake. Thread-safe.
 func (f *AccountFSM) SetNextWake(t time.Time) {
@@ -121,6 +131,8 @@ func (f *AccountFSM) ForceConfirm() error {
 		// reset of the SAME credit with the SAME request id, right now.
 		if !f.manualReset {
 			f.manualReset = true
+			f.attempt.Attempt = 0 // fresh manual retry budget; same key and target
+			f.attempt.NextRetryAt = time.Time{}
 			f.nextWake = f.now()
 		}
 		return nil
@@ -237,8 +249,7 @@ func (f *AccountFSM) retryInterval() time.Duration {
 	return f.Cfg.RetryInterval
 }
 
-// patrolRetryAt is when a failed patrol/confirmation looks again: the sooner
-// of the patrol interval and patrolErrorRetryInterval.
+// patrolRetryAt is when a failed patrol/confirmation looks again.
 func (f *AccountFSM) patrolRetryAt(now time.Time) time.Time {
 	return now.Add(f.retryInterval())
 }
@@ -459,12 +470,14 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 			}
 		}
 		if found == nil {
+			// Give the server the usual settle time (a credit can briefly be
+			// "redeeming") before the deduction check.
 			f.state = StateVERIFYING
-			f.verifyDue = now
-			f.nextWake = now
+			f.verifyDue = now.Add(postResetVerifyDelay)
+			f.nextWake = f.verifyDue
 			f.log("warn", fmt.Sprintf("credit %s is no longer available before retry; verifying the earlier attempt instead of resending", shortID(f.attempt.TargetCreditID)),
-				"verify", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
-			return now
+				"verify", timePtr(f.verifyDue), map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+			return f.verifyDue
 		}
 		if auto {
 			if found.ExpiresAt.IsZero() {
@@ -486,8 +499,12 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		case f.attempt.TargetExpiresAt.IsZero() || !now.Before(f.attempt.TargetExpiresAt):
 			return f.abandonAuto("error", fmt.Sprintf("credit %s expired before the reset request could be sent", shortID(f.attempt.TargetCreditID)))
 		case now.Before(f.attempt.TargetExpiresAt.Add(-f.Cfg.TriggerLeadTime)):
-			// Its expiry moved later: not due any more. Re-arm (new id later).
+			// Its expiry moved later: not due any more. Re-arm (new id later),
+			// or end the cycle if it is no longer within one patrol of T.
 			T := f.attempt.TargetExpiresAt.Add(-f.Cfg.TriggerLeadTime)
+			if now.Before(T.Add(-f.Cfg.RefreshInterval)) {
+				return f.abandonAuto("info", "target credit's expiry moved far out; no reset request sent, normal patrols resume")
+			}
 			f.state = StateARMED
 			f.attempt = ResetAttempt{}
 			f.nextWake = T
@@ -639,7 +656,7 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 			"cycle complete", nil, details)
 	default:
 		f.log("error",
-			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
+			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v; no compensating request (patrols continue)",
 				targetGone, countDown1, quotaUp),
 			"abandon", nil, details)
 	}

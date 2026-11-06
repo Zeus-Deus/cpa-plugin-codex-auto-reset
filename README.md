@@ -2,7 +2,7 @@
 > v8.0.51; it is not published to the plugin store. Differences from upstream v0.1.14:
 >
 > - **Defaults:** redeem **1h** before expiry (`trigger_lead_time`, max 2h), patrol every 6h (max 24h),
->   and retry every **10m** (`retry_interval`, 1m to 1h) until the credit expires.
+>   and retry every **10m** (`retry_interval`, 1m to 30m) until the credit expires.
 > - **Always the credit about to expire.** At every confirmation the target is the soonest-expiring
 >   available credit (re-pinned if that changed), and an automatic request is only ever sent inside
 >   `[its expiry - lead, its expiry)`. Credits that never expire are never redeemed automatically. After any
@@ -18,7 +18,8 @@
 >   checked lock-free right before every automatic request. While paused, patrols keep running read-only and
 >   no automatic request is sent. Manual Reset still works: it takes over a pending automatic retry (same
 >   credit and request id), and answers 409 while a reset is being verified. `paused: true` in `config_yaml`
->   is a hard operator switch the API cannot override.
+>   is a hard operator switch the API cannot override. Removing it later leaves the saved switch as it was;
+>   resume via the API/UI if needed.
 > - **Stability:**
 >   - One state lock shared by the worker and the management handlers. Upstream could hit Go's fatal
 >     concurrent-map error and crash the proxy.
@@ -208,7 +209,7 @@ The plugin reads its 3 user-tunable fields from `config_yaml`:
 ```yaml
 refresh_interval: 6h         # IDLE patrol cadence (fork default 6h, max 24h)
 trigger_lead_time: 1h        # redeem this long before a credit expires (fork default 1h, max 2h)
-retry_interval: 10m          # fork: retry cadence until expiry (1m-1h)
+retry_interval: 10m          # fork: retry cadence until expiry (1m-30m)
 paused: false                # fork: true = hard off switch for automatic redeem
 enabled_accounts:            # default: ["*"] — every Codex account CPA knows,
   - auth_index_1             # including accounts added after startup. Replace

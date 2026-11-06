@@ -408,7 +408,7 @@ func TestFork_InvalidExpiryNeverTargeted(t *testing.T) {
 
 func TestFork_LeadAndRetryClamped(t *testing.T) {
 	cfg := normalizeConfig(Config{RefreshInterval: time.Hour, TriggerLeadTime: 720 * time.Hour, RetryInterval: 5 * time.Hour})
-	if cfg.TriggerLeadTime != 2*time.Hour || cfg.RetryInterval != time.Hour {
+	if cfg.TriggerLeadTime != 2*time.Hour || cfg.RetryInterval != 30*time.Minute {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, filepath.Join(t.TempDir(), "s.json"), nil)
@@ -569,6 +569,7 @@ func TestFork_MalformedCreditsRejected(t *testing.T) {
 
 // An older snapshot never overwrites a newer one on disk.
 func TestFork_StateWritesAreOrdered(t *testing.T) {
+	t.Cleanup(func() { lastWrittenPath, lastWrittenSeq = "", 0 })
 	path := filepath.Join(t.TempDir(), "state.json")
 	if err := writeStateFileSeq(path, []byte(`{"v":2}`), 1<<62); err != nil {
 		t.Fatal(err)
@@ -580,5 +581,28 @@ func TestFork_StateWritesAreOrdered(t *testing.T) {
 	if string(raw) != `{"v":2}` {
 		t.Fatalf("stale snapshot won: %s", raw)
 	}
-	lastWrittenPath, lastWrittenSeq = "", 0
+}
+
+// The config_yaml hard pause gates automatic consumes even if the live switch
+// says "on" (e.g. a resume raced a reload).
+func TestFork_ForcedPauseGatesConsume(t *testing.T) {
+	forcedPaused.Store(true)
+	defer forcedPaused.Store(false)
+	E := time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)
+	clock := &fakeClock{t: E.Add(-30 * time.Minute)}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	w := NewWorker(forkCfg(), []string{"acct"}, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
+	}, clock.Now)
+	w.ensureFSM("acct")
+	for i := 0; i < 5; i++ {
+		w.stepAccountSafe("acct")
+	}
+	if fc.consumeCalls != 0 {
+		t.Fatalf("consumed under forced pause: %v", fc.consumeIDs)
+	}
 }

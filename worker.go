@@ -151,6 +151,13 @@ func (w *Worker) Stop() {
 	w.mu.Unlock()
 }
 
+// isPaused is the automatic-redeem gate: the live switch, or the operator's
+// config_yaml hard pause (checked again here so a resume racing a reload that
+// adds `paused: true` can never send an automatic request).
+func (w *Worker) isPaused() bool {
+	return w.paused.Load() || forcedPaused.Load()
+}
+
 // isStopped reports whether Stop was called. FSMs consult it right before a
 // consume so a replaced worker never sends one after its successor started.
 func (w *Worker) isStopped() bool {
@@ -209,25 +216,23 @@ func (w *Worker) SetPaused(paused bool) {
 func (w *Worker) TriggerCheck(authID string) error {
 	w.mu.Lock()
 	now := w.nowFn()
+	var targets []*AccountFSM
 	if authID == "" {
 		for _, fsm := range w.fsms {
-			if fsm.State() == StateIDLE {
-				fsm.SetNextWake(now)
-			}
+			targets = append(targets, fsm)
 		}
-		w.mu.Unlock()
-		w.wake()
-		return nil
-	}
-	fsm, ok := w.fsms[authID]
-	if !ok {
+	} else if fsm, ok := w.fsms[authID]; ok {
+		targets = append(targets, fsm)
+	} else {
 		w.mu.Unlock()
 		return fmt.Errorf("account %q not found (is it enabled?)", authID)
 	}
-	if fsm.State() == StateIDLE {
-		fsm.SetNextWake(now)
-	}
 	w.mu.Unlock()
+	// FSM calls happen outside w.mu: an FSM lock can be held for an
+	// in-flight HTTP step, and the IDLE check + wake write is atomic there.
+	for _, fsm := range targets {
+		fsm.PullPatrolIfIdle(now)
+	}
 	w.wake()
 	return nil
 }
@@ -239,12 +244,12 @@ func (w *Worker) TriggerCheck(authID string) error {
 func (w *Worker) ForceConfirm(authID string) error {
 	w.mu.Lock()
 	fsm, ok := w.fsms[authID]
+	w.mu.Unlock()
 	if !ok {
-		w.mu.Unlock()
 		return fmt.Errorf("account %q not found (is it enabled?)", authID)
 	}
+	// Outside w.mu: the FSM lock can be held for an in-flight HTTP step.
 	err := fsm.ForceConfirm()
-	w.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -416,7 +421,7 @@ func (w *Worker) ensureFSM(id string) {
 	fsm.Halted = w.isStopped
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
-	fsm.PausedFn = w.paused.Load
+	fsm.PausedFn = w.isPaused
 	fsm.SetNextWake(w.nowFn())
 	w.mu.Lock()
 	if _, ok := w.fsms[id]; !ok {

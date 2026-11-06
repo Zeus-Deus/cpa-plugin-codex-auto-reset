@@ -168,13 +168,17 @@ var (
 )
 
 func quiescePlugin() {
-	retired.Store(true)
 	pluginStateMu.Lock()
 	w := globalWorker
+	path := globalStatePath
 	pluginStateMu.Unlock()
 	if w != nil {
 		w.StopAndWait(shutdownWait)
 	}
+	if path != "" {
+		_ = SaveStateNow(path) // final flush, then hand the file over
+	}
+	retired.Store(true)
 }
 
 // underAuthDir reports whether path lies inside CPA's auth dir (derived from
@@ -479,6 +483,9 @@ func configurePlugin(raw []byte) error {
 // PUT /settings so config changes (enabled_accounts, refresh_interval) take
 // effect immediately instead of requiring a plugin reload.
 func restartWorkerFromState() {
+	if retired.Load() {
+		return // a newer image owns the accounts; never start a worker here
+	}
 	// Stop the old worker and wait for its in-flight step OUTSIDE the state
 	// lock (its StateSync takes pluginStateMu), so two workers never run
 	// steps for the same account at once.
@@ -972,5 +979,3 @@ func SaveStateNow(path string) error {
 	}
 	return writeStateFileSeq(path, raw, seq)
 }
-
-var _ = strings.TrimSpace
